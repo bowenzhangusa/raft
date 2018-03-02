@@ -77,11 +77,38 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
+// example AppendEntriesRPC arguments structure
+type AppendEntriesArgs struct {
+	Term              int // term number
+	LeaderId          int // id of the leader
+	PrevLogIndex      int // index of the log immediately preceding new ones
+	PrevLogTerm       int // term of prevLogIndex entry
+	LogEntries        []Log //log entries to store. For heartbeat, this is empty. May send more than one for efficiency
+	LeaderCommitIndex int
+
+}
+
+// example AppendEntriesRPC reply structure
+type AppendEntriesReply struct {
+	Term      int // term number
+	Success   bool //true if follower contains log entry matching PrevLogIndex and PrevLogTerm
+}
+
+//
+// example RequestVote RPC handler.
+//
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	// Your code here (3A, 3B).
+}
+
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
-	// Your data here (3A, 3B).
+	Term         int // this is the term number of the election
+	CandidateId  int // id of candidate requesting the vote
+	LastLogIndex int // index of the candidate's last log entry
+	LastLogTerm  int // term number of the candidate's last log entry
 }
 
 //
@@ -89,7 +116,8 @@ type RequestVoteArgs struct {
 // field names must start with capital letters!
 //
 type RequestVoteReply struct {
-	// Your data here (3A).
+	Term         int // term number of the election
+	VoteGranted  bool // If the vote is granted
 }
 
 //
