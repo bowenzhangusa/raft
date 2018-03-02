@@ -33,6 +33,15 @@ type ApplyMsg struct {
 }
 
 //
+// this is our representation of Log entry which contains the command
+// and  a term when the entry is received by the leader
+//
+type Log struct {
+	Command     interface{}
+	term        int // term when the entry is received by the leader, starts at 1
+}
+
+//
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
@@ -40,9 +49,21 @@ type Raft struct {
 	peers []*labrpc.ClientEnd // RPC end points of all peers
 	me    int                 // this peer's index into peers[]
 
-	// Your data here (3A, 3B).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
+	currentTerm   int //This is the term number starting at 1
+	votedFor      int //CandidateId that this server voted for in this term
+	logEntries    []Log
+
+	// The following variables are volatile states on all servers
+	// Both of the following indices increase monotonically and cannot decrease or go back
+	commitIndex   int // index of highest log entry known to be committed
+	lastApplied   int // index of the highest log entry applied to state machines
+
+	// The following are leader related properties
+	isLeader      bool
+	nextIndex     []int // for each server, index of the next log entry to send to that server
+						// initialzed to leader's lasst log index + 1
+	matchIndex    []int // for each server, index of highest log entry known to be replicated on that server
+						// initialized to zero, increases monotonically
 
 }
 
