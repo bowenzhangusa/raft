@@ -18,7 +18,7 @@ package raft
 //
 
 import "sync"
-import "labrpc"
+import "../labrpc"
 
 //
 // as each Raft peer becomes aware that successive log entries are
