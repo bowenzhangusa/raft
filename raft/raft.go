@@ -75,11 +75,7 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
-	// Your code here (3A).
-	return term, isleader
+	return rf.currentTerm, rf.isLeader
 }
 
 // example AppendEntriesRPC arguments structure
@@ -130,7 +126,17 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
-	DPrintf("Request vote received from %d", args.CandidateId)
+	DPrintf("Request vote received from %d, current term %d, args term %d", args.CandidateId, rf.currentTerm, args.Term)
+
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = false
+
+	// TODO make correct check for up-to-date log
+	if rf.currentTerm < args.Term &&
+		(rf.votedFor == 0 || rf.votedFor == args.CandidateId) {
+		rf.votedFor = args.CandidateId
+		reply.VoteGranted = true
+	}
 }
 
 //
@@ -207,8 +213,10 @@ func (rf *Raft) listen() {
 			DPrintf("AppendEntries received: %+v", args)
 
 		case <-time.After(time.Duration(700+rand.Intn(300)) * time.Millisecond):
-			DPrintf("Timeout, will request votes")
-			rf.becomeCandidate()
+			if !rf.isLeader {
+				DPrintf("Timeout, will request votes")
+				rf.becomeCandidate()
+			}
 		}
 	}
 }
@@ -219,17 +227,11 @@ func (rf *Raft) becomeCandidate() {
 
 	rf.currentTerm++
 	rf.votedFor = rf.me
-	var lastLogTerm int
-
-	if len(rf.logEntries) > 0 {
-		lastLogTerm = rf.logEntries[len(rf.logEntries)-1].term
-	} else {
-		lastLogTerm = 0
-	}
 
 	args := RequestVoteArgs{
+		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
-		LastLogTerm:  lastLogTerm,
+		LastLogTerm:  rf.currentTerm,
 		LastLogIndex: len(rf.logEntries) - 1,
 	}
 	responses := make([]RequestVoteReply, len(rf.peers))
@@ -242,6 +244,18 @@ func (rf *Raft) becomeCandidate() {
 		DPrintf("Sending vote request to %d", i)
 		rf.sendRequestVote(i, &args, &responses[i])
 	}
+
+	grantedVoteCount := 0
+
+	for _, r := range responses {
+		if r.VoteGranted {
+			grantedVoteCount++
+		}
+	}
+
+	rf.isLeader = grantedVoteCount > len(rf.peers)/2
+	DPrintf("Granted vote count: %d of %d, isLeader: %d", grantedVoteCount, len(rf.peers), rf.isLeader)
+
 }
 
 //
