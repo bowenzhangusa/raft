@@ -30,9 +30,9 @@ const EVENT_APPEND_ENTRIES_RECEIVED = 2
 const EVENT_APPEND_ENTRIES_SEND_SUCCESS = 3
 const EVENT_APPEND_ENTRIES_SEND_FAIL = 4
 
-const STATUS_FOLLOWER=0
-const STATUS_CANDIDATE=1
-const STATUS_LEADER=2
+const STATUS_FOLLOWER = 0
+const STATUS_CANDIDATE = 1
+const STATUS_LEADER = 2
 
 // This is passed from RPC handlers to "handleEvent"
 // to keep business logic in one place
@@ -81,7 +81,7 @@ type Raft struct {
 	lastApplied int // index of the highest log entry applied to state machines
 
 	// The following are leader related properties
-	status    int // status of a raft. 0 means follower, 1 means candidate, 2 means leader
+	status    int   // status of a raft. 0 means follower, 1 means candidate, 2 means leader
 	nextIndex []int // for each server, index of the next log entry to send to that server
 	// initialzed to leader's lasst log index + 1
 	matchIndex []int // for each server, index of highest log entry known to be replicated on that server
@@ -170,34 +170,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if rf.currentTerm < args.Term { // If a new term starts, grant the vote
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
-		} else if rf.currentTerm == args.Term {// if in the same term, whoever has longer log is more up-to-date
-			if len(rf.logEntries) <= args.LastLogIndex + 1 {
+		} else if rf.currentTerm == args.Term { // if in the same term, whoever has longer log is more up-to-date
+			if len(rf.logEntries) <= args.LastLogIndex+1 {
 				reply.VoteGranted = true
 				rf.votedFor = args.CandidateId
 			}
 		}
 	}
 
-	/*candidateTermIsNewer := args.Term >= rf.currentTerm
-	canVote := false
-	candidateIsUpToDate := false
-
-	if candidateTermIsNewer {
-		canVote = rf.votedFor == 0 || rf.votedFor == args.CandidateId
-		candidateIsUpToDate = args.LastLogTerm >= rf.currentTerm && args.LastLogIndex >= rf.lastApplied
-
-		if canVote && candidateIsUpToDate {
-			rf.votedFor = args.CandidateId
-			reply.VoteGranted = true
-		}
-	}
-
 	DPrintf(
-		"%d received vote request from %d, candidate term is newer: %t, "+
-			"can vote: %t, is up to date: %t, granted: %t",
-		rf.me, args.CandidateId, candidateTermIsNewer,
-		canVote, candidateIsUpToDate, reply.VoteGranted)
-	*/
+		"%d received vote request from %d, granted: %t",
+		rf.me, args.CandidateId, reply.VoteGranted)
 }
 
 //
