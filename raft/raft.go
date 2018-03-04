@@ -30,6 +30,10 @@ const EVENT_APPEND_ENTRIES_RECEIVED = 2
 const EVENT_APPEND_ENTRIES_SEND_SUCCESS = 3
 const EVENT_APPEND_ENTRIES_SEND_FAIL = 4
 
+const STATUS_FOLLOWER=0
+const STATUS_CANDIDATE=1
+const STATUS_LEADER=2
+
 // This is passed from RPC handlers to "handleEvent"
 // to keep business logic in one place
 type Event struct {
@@ -77,10 +81,8 @@ type Raft struct {
 	lastApplied int // index of the highest log entry applied to state machines
 
 	// The following are leader related properties
-	isLeader    bool
-	isCandidate bool
-	isFollower  bool
-	nextIndex   []int // for each server, index of the next log entry to send to that server
+	status    int // status of a raft. 0 means follower, 1 means candidate, 2 means leader
+	nextIndex []int // for each server, index of the next log entry to send to that server
 	// initialzed to leader's lasst log index + 1
 	matchIndex []int // for each server, index of highest log entry known to be replicated on that server
 	// initialized to zero, increases monotonically
@@ -94,7 +96,7 @@ type Raft struct {
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return rf.currentTerm, rf.isLeader
+	return rf.currentTerm, rf.status == STATUS_LEADER
 }
 
 // example AppendEntriesRPC arguments structure
@@ -114,7 +116,7 @@ type AppendEntriesReply struct {
 }
 
 //
-// example RequestVote RPC handler.
+// example AppendEntries RPC handler.
 //
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.BecomeFollowerIfTermIsOlder(args.Term, "term update on AppendEntries request")
@@ -155,16 +157,28 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if !rf.isFollower {
-		DPrintf("Non-follower %d (isCandidate: %t, isLeader: %t) received RequestVote from %d, ignoring",
-			rf.me, rf.isCandidate, rf.isLeader, args.CandidateId)
+	if rf.status != STATUS_FOLLOWER {
+		DPrintf("Non-follower %d (status=%d) received RequestVote from %d, ignoring",
+			rf.me, rf.status, args.CandidateId)
 		return
 	}
 
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 
-	candidateTermIsNewer := args.Term >= rf.currentTerm
+	if rf.votedFor == 0 { // first check to grant vote is that raft has yet to vote in the term
+		if rf.currentTerm < args.Term { // If a new term starts, grant the vote
+			reply.VoteGranted = true
+			rf.votedFor = args.CandidateId
+		} else if rf.currentTerm == args.Term {// if in the same term, whoever has longer log is more up-to-date
+			if len(rf.logEntries) <= args.LastLogIndex + 1 {
+				reply.VoteGranted = true
+				rf.votedFor = args.CandidateId
+			}
+		}
+	}
+
+	/*candidateTermIsNewer := args.Term >= rf.currentTerm
 	canVote := false
 	candidateIsUpToDate := false
 
@@ -183,6 +197,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			"can vote: %t, is up to date: %t, granted: %t",
 		rf.me, args.CandidateId, candidateTermIsNewer,
 		canVote, candidateIsUpToDate, reply.VoteGranted)
+	*/
 }
 
 //
@@ -402,10 +417,8 @@ func (rf *Raft) BecomeLeader() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if !rf.isLeader {
-		rf.isCandidate = false
-		rf.isFollower = false
-		rf.isLeader = true
+	if rf.status != STATUS_LEADER {
+		rf.status = STATUS_LEADER
 		rf.votedFor = 0
 		DPrintf("%d is now a leader", rf.me)
 	}
@@ -416,10 +429,8 @@ func (rf *Raft) BecomeCandidate() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if !rf.isCandidate {
-		rf.isLeader = false
-		rf.isCandidate = true
-		rf.isFollower = false
+	if rf.status != STATUS_CANDIDATE {
+		rf.status = STATUS_CANDIDATE
 		rf.currentTerm++
 		rf.votedFor = rf.me
 	}
@@ -430,12 +441,9 @@ func (rf *Raft) BecomeFollower() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if !rf.isFollower {
+	if rf.status != STATUS_FOLLOWER {
 		DPrintf("%d is now a follower", rf.me)
-		rf.isFollower = true
-		rf.isLeader = false
-		rf.isCandidate = false
-		rf.votedFor = 0
+		rf.status = STATUS_FOLLOWER
 	}
 }
 
@@ -449,9 +457,7 @@ func (rf *Raft) BecomeFollowerIfTermIsOlder(term int, comment string) {
 		DPrintf(
 			"%d term updated, new: %d, old: %d, it is now a follower. [%s]",
 			rf.me, rf.currentTerm, term, comment)
-		rf.isFollower = true
-		rf.isLeader = false
-		rf.isCandidate = false
+		rf.status = STATUS_FOLLOWER
 		rf.currentTerm = term
 		rf.votedFor = 0
 	}
@@ -472,7 +478,7 @@ func (rf *Raft) listen() {
 			rf.handleEvent(event)
 			break;
 		case <-rf.electionTimer.C:
-			if rf.isFollower {
+			if rf.status == STATUS_FOLLOWER {
 				DPrintf("%d election timeout", rf.me)
 				rf.BecomeCandidate()
 				go rf.sendRequestVoteToAllPeers()
@@ -481,7 +487,7 @@ func (rf *Raft) listen() {
 			break;
 		case <-heartbeatTicker.C:
 			// time to send a heartbeat
-			if rf.isLeader {
+			if rf.status == STATUS_LEADER {
 				go rf.sendAppendEntriesToAllPeers()
 			}
 			break;
@@ -493,7 +499,7 @@ func (rf *Raft) listen() {
 func (rf *Raft) handleEvent(event Event) {
 	switch (event.Type) {
 	case EVENT_VOTES_GRANTED:
-		if rf.isCandidate {
+		if rf.status == STATUS_CANDIDATE {
 			rf.BecomeLeader()
 			go rf.sendAppendEntriesToAllPeers()
 		} else {
@@ -532,7 +538,7 @@ func Make(peers []*labrpc.ClientEnd, me int, applyCh chan ApplyMsg) *Raft {
 	log.SetFlags(log.Lmicroseconds)
 	rf.peers = peers
 	rf.me = me
-	rf.isFollower = true // everyone starts as a follower
+	rf.status = STATUS_FOLLOWER
 	rf.eventCh = make(chan Event)
 	rf.electionTimer = time.NewTimer(getElectionTimeout())
 
