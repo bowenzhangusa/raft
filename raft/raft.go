@@ -63,7 +63,7 @@ type Raft struct {
 	lastApplied int // index of the highest log entry applied to state machines
 
 	// The following are leader related properties
-	isLeader  bool
+	status    int // status of a raft. 0 means follower, 1 means candidate, 2 means leader
 	nextIndex []int // for each server, index of the next log entry to send to that server
 	// initialzed to leader's lasst log index + 1
 	matchIndex []int // for each server, index of highest log entry known to be replicated on that server
@@ -75,7 +75,7 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-	return rf.currentTerm, rf.isLeader
+	return rf.currentTerm, rf.status == 2
 }
 
 // example AppendEntriesRPC arguments structure
@@ -213,7 +213,7 @@ func (rf *Raft) listen() {
 			DPrintf("AppendEntries received: %+v", args)
 
 		case <-time.After(time.Duration(700+rand.Intn(300)) * time.Millisecond):
-			if !rf.isLeader {
+			if rf.status != 2 { // if the raft instance is not a leader
 				DPrintf("Timeout, will request votes")
 				rf.becomeCandidate()
 			}
@@ -253,8 +253,10 @@ func (rf *Raft) becomeCandidate() {
 		}
 	}
 
-	rf.isLeader = grantedVoteCount > len(rf.peers)/2
-	DPrintf("Granted vote count: %d of %d, isLeader: %d", grantedVoteCount, len(rf.peers), rf.isLeader)
+	if grantedVoteCount > len(rf.peers)/2 {
+		rf.status = 2
+	}
+	DPrintf("Granted vote count: %d of %d, status: %d", grantedVoteCount, len(rf.peers), rf.status)
 
 }
 
