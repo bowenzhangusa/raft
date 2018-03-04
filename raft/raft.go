@@ -95,7 +95,7 @@ type AppendEntriesReply struct {
 }
 
 //
-// example RequestVote RPC handler.
+// example AppendEntries RPC handler.
 //
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.appendEntriesChannel <- args
@@ -132,10 +132,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.VoteGranted = false
 
 	// TODO make correct check for up-to-date log
-	if rf.currentTerm < args.Term &&
-		(rf.votedFor == 0 || rf.votedFor == args.CandidateId) {
-		rf.votedFor = args.CandidateId
-		reply.VoteGranted = true
+	if rf.votedFor == 0 { // first check to grant vote is that raft has yet to vote in the term
+		if rf.currentTerm < args.Term { // If a new term starts, grant the vote
+			reply.VoteGranted = true
+			rf.votedFor = args.CandidateId
+		} else if rf.currentTerm == args.Term {// if in the same term, whoever has longer log is more up-to-date
+			if len(rf.logEntries) <= args.LastLogIndex + 1 {
+				reply.VoteGranted = true
+				rf.votedFor = args.CandidateId
+			}
+		}
 	}
 }
 
@@ -227,6 +233,7 @@ func (rf *Raft) becomeCandidate() {
 
 	rf.currentTerm++
 	rf.votedFor = rf.me
+	rf.status = 1
 
 	args := RequestVoteArgs{
 		Term:         rf.currentTerm,
