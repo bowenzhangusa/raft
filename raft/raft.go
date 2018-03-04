@@ -157,14 +157,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if rf.status != STATUS_FOLLOWER {
-		DPrintf("Non-follower %d (status=%d) received RequestVote from %d, ignoring",
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = false
+
+	if rf.status == STATUS_LEADER {
+		DPrintf("Leader %d received RequestVote from %d, vote denied",
 			rf.me, rf.status, args.CandidateId)
 		return
 	}
-
-	reply.Term = rf.currentTerm
-	reply.VoteGranted = false
 
 	if rf.votedFor == 0 { // first check to grant vote is that raft has yet to vote in the term
 		if rf.currentTerm < args.Term { // If a new term starts, grant the vote
