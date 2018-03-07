@@ -446,7 +446,7 @@ func (rf *Raft) getMajoritySize() int {
 // Listens for events and timers
 func (rf *Raft) listen() {
 	heartbeatTicker := time.NewTicker(HEARTBEAT_FREQUENCY)
-	DPrintf("[%d] started, majority size = %d", rf.me, rf.getMajoritySize())
+	DPrintf("[%d] started", rf.me)
 
 	for {
 		select {
@@ -498,7 +498,7 @@ func (rf *Raft) handleEvent(event Event) {
 	case EVENT_APPEND_ENTRIES_RECEIVED:
 		// TODO: add entries to log
 		rf.electionTimer.Reset(getElectionTimeout())
-		DPrintf("[%d] AppendEntries received from %d", event.Peer, rf.me)
+		DPrintf("[%d] AppendEntries received from %d", rf.me, event.Peer)
 		break;
 	}
 }
