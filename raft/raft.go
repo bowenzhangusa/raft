@@ -26,12 +26,11 @@ import (
 )
 
 // how often to send heartbeats
-const HEARTBEAT_FREQUENCY = 150 * time.Millisecond
+const HEARTBEAT_FREQUENCY = 100 * time.Millisecond
 
 const EVENT_VOTES_GRANTED = 1
 const EVENT_APPEND_ENTRIES_RECEIVED = 2
 const EVENT_APPEND_ENTRIES_SEND_SUCCESS = 3
-const EVENT_APPEND_ENTRIES_SEND_FAIL = 4
 
 const STATUS_FOLLOWER = 0
 const STATUS_CANDIDATE = 1
@@ -122,7 +121,7 @@ type AppendEntriesReply struct {
 // example AppendEntries RPC handler.
 //
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.BecomeFollowerIfTermIsOlder(args.Term, fmt.Sprintf("AppendEntries request from %d", args.LeaderId))
+	rf.BecomeFollowerIfTermIsOlder(args.Term, true, fmt.Sprintf("AppendEntries request from %d", args.LeaderId))
 
 	if args.Term < rf.currentTerm {
 		reply.Success = false
@@ -131,6 +130,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = true
 	}
 
+	reply.Term = rf.currentTerm
 }
 
 // example RequestVote RPC arguments structure.
@@ -156,18 +156,12 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	rf.BecomeFollowerIfTermIsOlder(args.Term, fmt.Sprintf("RequestVote request from %d", args.CandidateId))
+	rf.BecomeFollowerIfTermIsOlder(args.Term, true, fmt.Sprintf("RequestVote request from %d", args.CandidateId))
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
-
-	if rf.status == STATUS_LEADER {
-		DPrintf("[%d] received RequestVote from %d, vote denied",
-			rf.me, rf.status, args.CandidateId)
-		return
-	}
 
 	if rf.votedFor == 0 { // first check to grant vote is that raft has yet to vote in the term
 		if rf.currentTerm < args.Term { // If a new term starts, grant the vote
@@ -181,9 +175,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 	}
 
-	DPrintf(
-		"[%d] received vote request from %d, granted: %t",
-		rf.me, args.CandidateId, reply.VoteGranted)
+	rf.DPrintf(
+		"received vote request from %d, granted: %t",
+		args.CandidateId, reply.VoteGranted)
 }
 
 //
@@ -238,7 +232,7 @@ func (rf *Raft) sendRequestVoteToAllPeers() {
 		IsOk bool
 	}
 	responseChan := make(chan ResponseMsg)
-	DPrintf("[%d] sends RequestVote", rf.me)
+	rf.DPrintf("sending RequestVote")
 
 	// send requests concurrently
 	for i, _ := range rf.peers {
@@ -249,7 +243,7 @@ func (rf *Raft) sendRequestVoteToAllPeers() {
 		go func(peerIndex int) {
 			resp := RequestVoteReply{}
 			ok := rf.sendRequestVote(peerIndex, &args, &resp)
-			DPrintf("[%d] received RequestVote response from %d, ok: %t, granted: %t", rf.me, peerIndex, ok, resp.VoteGranted)
+			rf.DPrintf("received RequestVote response from %d, ok: %t, granted: %t", peerIndex, ok, resp.VoteGranted)
 			responseChan <- ResponseMsg{
 				resp,
 				ok,
@@ -264,7 +258,7 @@ func (rf *Raft) sendRequestVoteToAllPeers() {
 		isGranted := resp.IsOk && resp.VoteGranted
 
 		if resp.IsOk {
-			rf.BecomeFollowerIfTermIsOlder(resp.Term, "RequestVotes response")
+			rf.BecomeFollowerIfTermIsOlder(resp.Term, false, "RequestVotes response")
 		}
 
 		if isGranted {
@@ -273,6 +267,7 @@ func (rf *Raft) sendRequestVoteToAllPeers() {
 			// - don't need to wait for other responses
 			if grantedVoteCount == rf.getMajoritySize() {
 				rf.eventCh <- Event{Type: EVENT_VOTES_GRANTED}
+				return
 			}
 		}
 	}
@@ -303,9 +298,12 @@ func (rf *Raft) sendAppendEntriesToAllPeers() {
 	type ResponseMsg struct {
 		AppendEntriesReply
 		IsOk bool
+		Peer int
+		// for debugging purposes - to see how delayed the response was
+		DateSent time.Time
 	}
 	responseChan := make(chan ResponseMsg)
-	DPrintf("[%d] sends AppendEntries", rf.me)
+	rf.DPrintf("sending AppendEntries")
 
 	// send requests concurrently
 	for i, _ := range rf.peers {
@@ -315,11 +313,13 @@ func (rf *Raft) sendAppendEntriesToAllPeers() {
 
 		go func(peerIndex int) {
 			resp := AppendEntriesReply{}
+			dateSent := time.Now()
 			ok := rf.sendAppendEntries(peerIndex, &args, &resp)
-			DPrintf("[%d] received AppendEntries response from %d, ok: %t, success: %t", rf.me, peerIndex, ok, resp.Success)
 			responseChan <- ResponseMsg{
 				resp,
 				ok,
+				peerIndex,
+				dateSent,
 			}
 		}(i)
 	}
@@ -329,11 +329,13 @@ func (rf *Raft) sendAppendEntriesToAllPeers() {
 
 	// collect responses
 	for resp := range responseChan {
+		rf.DPrintf("received AppendEntries response from %d, ok: %t, success: %t, sent at: %s", resp.Peer, resp.IsOk, resp.Success, resp.DateSent.Format(time.StampMicro))
+
 		// no network/host failure AND host agreed to append
 		isOk := resp.IsOk && resp.Success
 
 		if resp.IsOk {
-			rf.BecomeFollowerIfTermIsOlder(resp.Term, "AppendEntries response")
+			rf.BecomeFollowerIfTermIsOlder(resp.Term, false, "AppendEntries response")
 		}
 
 		// if enough responses received, send the result on a channel
@@ -345,10 +347,17 @@ func (rf *Raft) sendAppendEntriesToAllPeers() {
 			}
 		} else {
 			failCount++
-			if failCount == rf.getMajoritySize() {
-				rf.eventCh <- Event{Type: EVENT_APPEND_ENTRIES_SEND_FAIL}
-			}
 		}
+	}
+}
+
+// Wrapper for debug print function,
+// that prints current host id and term automatically
+func (rf *Raft) DPrintf(format string, a ...interface{}) {
+	if Debug == 1 {
+		args := make([]interface{}, 0, 3+len(a))
+		args = append(append(args, rf.me, rf.status, rf.currentTerm), a...)
+		DPrintf("[i%d s%d t%d] "+format, args...)
 	}
 }
 
@@ -393,7 +402,7 @@ func (rf *Raft) BecomeLeader() {
 	if rf.status != STATUS_LEADER {
 		rf.status = STATUS_LEADER
 		rf.votedFor = 0
-		DPrintf("[%d] is now a leader", rf.me)
+		rf.DPrintf("became a leader")
 	}
 }
 
@@ -402,11 +411,9 @@ func (rf *Raft) BecomeCandidate() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if rf.status != STATUS_CANDIDATE {
-		rf.status = STATUS_CANDIDATE
-		rf.currentTerm++
-		rf.votedFor = rf.me
-	}
+	rf.status = STATUS_CANDIDATE
+	rf.currentTerm++
+	rf.votedFor = rf.me
 }
 
 // Turns current host into follower
@@ -415,27 +422,32 @@ func (rf *Raft) BecomeFollower() {
 	defer rf.mu.Unlock()
 
 	if rf.status != STATUS_FOLLOWER {
-		DPrintf("[%d] is now a follower", rf.me)
 		rf.status = STATUS_FOLLOWER
+		rf.DPrintf("became a follower")
 		rf.electionTimer.Reset(getElectionTimeout())
 	}
 }
 
 // Turns current host into follower and updates its term, if given term is newer.
 // Comment is used only for debug.
-func (rf *Raft) BecomeFollowerIfTermIsOlder(term int, comment string) {
+func (rf *Raft) BecomeFollowerIfTermIsOlder(term int, followIfEqual bool, comment string) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if rf.currentTerm < term {
-		DPrintf(
-			"[%d] [%s] term updated, new: %d, old: %d. Host is now a follower",
-			rf.me, comment, rf.currentTerm, term)
+	if (rf.currentTerm < term) || (followIfEqual && rf.currentTerm == term && rf.status != STATUS_FOLLOWER) {
 		rf.status = STATUS_FOLLOWER
+		oldTerm := rf.currentTerm
 		rf.currentTerm = term
 		rf.votedFor = 0
 		rf.electionTimer.Reset(getElectionTimeout())
+		rf.DPrintf(
+			"[%s] term updated, old: %d. Host is now a follower",
+			comment, oldTerm)
+
+		return true
 	}
+
+	return false
 }
 
 // Returns the number of hosts that forms a majority
@@ -446,7 +458,7 @@ func (rf *Raft) getMajoritySize() int {
 // Listens for events and timers
 func (rf *Raft) listen() {
 	heartbeatTicker := time.NewTicker(HEARTBEAT_FREQUENCY)
-	DPrintf("[%d] started", rf.me)
+	rf.DPrintf("started")
 
 	for {
 		select {
@@ -455,8 +467,8 @@ func (rf *Raft) listen() {
 			break;
 		case <-rf.electionTimer.C:
 			// time to initiate an election
-			if rf.status == STATUS_FOLLOWER {
-				DPrintf("[%d] election timeout", rf.me)
+			if rf.status != STATUS_LEADER {
+				rf.DPrintf("election timeout")
 				rf.BecomeCandidate()
 				go rf.sendRequestVoteToAllPeers()
 			}
@@ -484,21 +496,17 @@ func (rf *Raft) handleEvent(event Event) {
 		} else {
 			// this might happen when votes from some older term are received,
 			// but this host is not a candidate any more, so we ignore it
-			DPrintf("[%d] got votes, but host is not a candidate (status=%d)", rf.me, rf.status)
+			rf.DPrintf("got votes, but host is not a candidate")
 		}
 		break
 	case EVENT_APPEND_ENTRIES_SEND_SUCCESS:
 		// TODO: commit entries
-		DPrintf("[%d] got AppendEntries response from majority", rf.me)
-		break
-	case EVENT_APPEND_ENTRIES_SEND_FAIL:
-		DPrintf("[%d] can't get AppendEntries response from majority, becoming a follower", rf.me)
-		rf.BecomeFollower()
+		rf.DPrintf("got AppendEntries response from majority")
 		break
 	case EVENT_APPEND_ENTRIES_RECEIVED:
 		// TODO: add entries to log
 		rf.electionTimer.Reset(getElectionTimeout())
-		DPrintf("[%d] AppendEntries received from %d", rf.me, event.Peer)
+		rf.DPrintf("AppendEntries received from %d", event.Peer)
 		break;
 	}
 }
