@@ -121,9 +121,9 @@ type AppendEntriesReply struct {
 // example AppendEntries RPC handler.
 //
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.BecomeFollowerIfTermIsOlder(args.Term, true, fmt.Sprintf("AppendEntries request from %d", args.LeaderId))
+	rf.becomeFollowerIfTermIsOlderOrEqual(args.Term, fmt.Sprintf("AppendEntries request from %d", args.LeaderId))
 
-	if args.Term < rf.currentTerm {
+	if args.Term < rf.currentTerm { // This happens when an old failed leader just woke up
 		reply.Success = false
 	} else {
 		rf.eventCh <- Event{Type: EVENT_APPEND_ENTRIES_RECEIVED, Peer: args.LeaderId}
@@ -156,7 +156,7 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	rf.BecomeFollowerIfTermIsOlder(args.Term, true, fmt.Sprintf("RequestVote request from %d", args.CandidateId))
+	rf.becomeFollowerIfTermIsOlder(args.Term, fmt.Sprintf("RequestVote request from %d", args.CandidateId))
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -258,18 +258,21 @@ func (rf *Raft) sendRequestVoteToAllPeers() {
 		isGranted := resp.IsOk && resp.VoteGranted
 
 		if resp.IsOk {
-			rf.BecomeFollowerIfTermIsOlder(resp.Term, false, "RequestVotes response")
-		}
-
-		if isGranted {
-			grantedVoteCount++
-			// if enough responses received, send the result on a channel
-			// - don't need to wait for other responses
-			if grantedVoteCount == rf.getMajoritySize() {
-				rf.eventCh <- Event{Type: EVENT_VOTES_GRANTED}
-				return
+			//rf.BecomeFollowerIfTermIsOlder(resp.Term, false, "RequestVotes response")
+			if isGranted {
+				grantedVoteCount++
+				// if enough responses received, send the result on a channel
+				// - don't need to wait for other responses
+				if grantedVoteCount == rf.getMajoritySize() {
+					rf.eventCh <- Event{Type: EVENT_VOTES_GRANTED}
+					return
+				}
+			} else {
+				rf.becomeFollowerIfTermIsOlder(resp.Term, "RequestVotes response")
 			}
 		}
+
+
 	}
 }
 
@@ -335,7 +338,8 @@ func (rf *Raft) sendAppendEntriesToAllPeers() {
 		isOk := resp.IsOk && resp.Success
 
 		if resp.IsOk {
-			rf.BecomeFollowerIfTermIsOlder(resp.Term, false, "AppendEntries response")
+			// this happens when we just woke up as a previous leader
+			rf.becomeFollowerIfTermIsOlder(resp.Term,  "AppendEntries response")
 		}
 
 		// if enough responses received, send the result on a channel
@@ -404,6 +408,13 @@ func (rf *Raft) BecomeLeader() {
 		rf.votedFor = 0
 		rf.DPrintf("became a leader")
 	}
+
+	if !rf.electionTimer.Stop() {
+		<- rf.electionTimer.C
+	}
+	// send heartbeat immediately without waiting for a ticker
+	// to make sure other peers will not timeout.
+	go rf.sendAppendEntriesToAllPeers()
 }
 
 // Turns current host into candidate
@@ -412,42 +423,49 @@ func (rf *Raft) BecomeCandidate() {
 	defer rf.mu.Unlock()
 
 	rf.status = STATUS_CANDIDATE
+	rf.DPrintf("old term number is %d", rf.currentTerm)
 	rf.currentTerm++
 	rf.votedFor = rf.me
 }
 
-// Turns current host into follower
-func (rf *Raft) BecomeFollower() {
+// Turns current host into follower during election because either we discovered the current leader or a new turn
+func (rf *Raft) becomeFollowerIfTermIsOlder(term int, comment string) {
+	// TODO: we will see if we need a lock here
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if rf.status != STATUS_FOLLOWER {
-		rf.status = STATUS_FOLLOWER
-		rf.DPrintf("became a follower")
-		rf.electionTimer.Reset(getElectionTimeout())
+	// check if we have a new term
+	if (rf.currentTerm < term) {
+		//rf.becomeFollower()
+		if rf.status != STATUS_FOLLOWER {
+			rf.status = STATUS_FOLLOWER
+			rf.electionTimer.Reset(getElectionTimeout())
+		}
+		oldTerm := rf.currentTerm
+		rf.currentTerm = term
+		rf.votedFor = 0
+		rf.DPrintf(
+			"[%s] ELECTION term updated, old: %d. Host is now a follower",
+			comment, oldTerm)
 	}
 }
-
 // Turns current host into follower and updates its term, if given term is newer.
 // Comment is used only for debug.
-func (rf *Raft) BecomeFollowerIfTermIsOlder(term int, followIfEqual bool, comment string) bool {
+func (rf *Raft) becomeFollowerIfTermIsOlderOrEqual(term int, comment string) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if (rf.currentTerm < term) || (followIfEqual && rf.currentTerm == term && rf.status != STATUS_FOLLOWER) {
+	if (rf.currentTerm <= term) { // a new leader sends a heartbeat
 		rf.status = STATUS_FOLLOWER
 		oldTerm := rf.currentTerm
 		rf.currentTerm = term
 		rf.votedFor = 0
 		rf.electionTimer.Reset(getElectionTimeout())
 		rf.DPrintf(
-			"[%s] term updated, old: %d. Host is now a follower",
+
+			"[%s]  NOT ELECTION term updated, old: %d. Host is now a follower",
 			comment, oldTerm)
-
-		return true
 	}
-
-	return false
 }
 
 // Returns the number of hosts that forms a majority
@@ -467,11 +485,9 @@ func (rf *Raft) listen() {
 			break;
 		case <-rf.electionTimer.C:
 			// time to initiate an election
-			if rf.status != STATUS_LEADER {
-				rf.DPrintf("election timeout")
-				rf.BecomeCandidate()
-				go rf.sendRequestVoteToAllPeers()
-			}
+			rf.DPrintf("election timeout")
+			rf.BecomeCandidate()
+			go rf.sendRequestVoteToAllPeers()
 			rf.electionTimer.Reset(getElectionTimeout())
 			break;
 		case <-heartbeatTicker.C:
@@ -490,9 +506,6 @@ func (rf *Raft) handleEvent(event Event) {
 	case EVENT_VOTES_GRANTED:
 		if rf.status == STATUS_CANDIDATE {
 			rf.BecomeLeader()
-			// send heartbeat immediately without waiting for a ticker
-			// to make sure other peers will not timeout.
-			go rf.sendAppendEntriesToAllPeers()
 		} else {
 			// this might happen when votes from some older term are received,
 			// but this host is not a candidate any more, so we ignore it
