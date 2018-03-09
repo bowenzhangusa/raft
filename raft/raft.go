@@ -140,7 +140,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			// check if we have log consistency
 			if args.PrevLogIndex >= len(rf.logEntries) {
 				reply.Success = false
-			} else if args.PrevLogTerm != rf.logEntries[args.PrevLogIndex].Term {
+			} else if args.PrevLogTerm > 0 && args.PrevLogIndex > -1 && args.PrevLogTerm != rf.logEntries[args.PrevLogIndex].Term {
 				reply.Success = false
 			} else {
 				reply.Success = true
@@ -437,11 +437,15 @@ func (rf *Raft) sendAppendEntriesToAllPeersForLogEntries(lastLogIndexFromLeader 
 
 		go func(peerIndex int) {
 			rf.mu.Lock()
+			prevLogTerm := 0
+			if lastLogIndexFromLeader > 0 {
+				prevLogTerm = rf.logEntries[lastLogIndexFromLeader - 1].Term
+			}
 			args := AppendEntriesArgs{
 				Term:              rf.currentTerm,
 				LeaderId:          rf.me,
 				PrevLogIndex: lastLogIndexFromLeader - 1,
-				PrevLogTerm:  rf.logEntries[lastLogIndexFromLeader-1].Term,
+				PrevLogTerm:  prevLogTerm,
 				LogEntries:        rf.logEntries[rf.nextIndex[peerIndex] : lastLogIndexFromLeader + 1],
 				LeaderCommitIndex: rf.commitIndex,
 			}
@@ -483,7 +487,7 @@ func (rf *Raft) sendAppendEntriesToAllPeersForLogEntries(lastLogIndexFromLeader 
 			successCount++
 
 			// Update the match index and next index for this particular follower
-			rf.matchIndex[resp.PeerIndex] = rf.nextIndex[resp.PeerIndex]
+			//rf.matchIndex[resp.PeerIndex] = rf.nextIndex[resp.PeerIndex]
 			rf.nextIndex[resp.PeerIndex] = rf.nextIndex[resp.PeerIndex] + 1
 
 			if successCount == rf.getMajoritySize() {
@@ -657,6 +661,8 @@ func Make(peers []*labrpc.ClientEnd, me int, applyCh chan ApplyMsg) *Raft {
 	rf.peers = peers
 	rf.me = me
 	rf.status = STATUS_FOLLOWER
+	rf.logEntries = []Log{}
+	rf.commitIndex = -1
 	rf.electionTimer = time.NewTimer(getElectionTimeout())
 	// event channel is used to consolidate business logic in a single function (handleEvent).
 	// it is not meant to process events asynchronously, so its buffer size is 1.
