@@ -93,8 +93,8 @@ type Raft struct {
 	electionTimer *time.Timer
 	eventCh       chan Event
 
-	// client request channel
-	requestCh     chan ApplyMsg
+	// message channel to client
+	clientCh chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -137,6 +137,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.eventCh <- Event{Type: EVENT_APPEND_ENTRIES_RECEIVED, Peer: args.LeaderId}
 			reply.Success = true
 		} else {
+			rf.DPrintf(
+
+				"There is a new log with prevLogIndex %d and prevLogTerm %d", args.PrevLogIndex, args.PrevLogTerm)
 			// check if we have log consistency
 			if args.PrevLogIndex >= len(rf.logEntries) {
 				reply.Success = false
@@ -145,7 +148,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			} else {
 				reply.Success = true
 				// append leader's log to its own logs
-				rf.logEntries = append(rf.logEntries, args.LogEntries...)
+				for _, entry := range args.LogEntries {
+					rf.logEntries = append(rf.logEntries, entry)
+
+					// NOTE TODO: Normally, we will send back the last index in our slice/array. However, log entries in actual raft
+					// NOTE TODO: starts at 1 instead of 0. So, we need to use len(logEntries) instead of len(logEntries)-1
+					rf.clientCh <- ApplyMsg{Index: len(rf.logEntries), Command: entry.Command}
+					rf.DPrintf(
+
+						"new message is committed at index %d",
+						len(rf.logEntries) - 1)
+				}
+
 				if args.LeaderCommitIndex > rf.commitIndex {
 					rf.commitIndex = min(args.LeaderCommitIndex, len(rf.logEntries) - 1)
 				}
@@ -409,10 +423,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	newLog := Log{Command: command, Term:rf.currentTerm, Position:len(rf.logEntries)}
 	rf.logEntries = append(rf.logEntries, newLog)
+
+	// Tell the client the leader appended the log entry
+	// NOTE TODO: Normally, we will send back the last index in our slice/array. However, log entries in actual raft
+	// NOTE TODO: starts at 1 instead of 0. So, we need to use len(logEntries) instead of len(logEntries)-1
+	rf.clientCh <- ApplyMsg{Index:len(rf.logEntries), Command:command}
 	newLength := len(rf.logEntries)
 	rf.mu.Unlock()
 	go rf.sendAppendEntriesToAllPeersForLogEntries(newLength-1)
-	return newLength-1, rf.currentTerm, true
+	return newLength, rf.currentTerm, true
 }
 
 // Send AppendEntries to all peers and collect results
@@ -449,6 +468,10 @@ func (rf *Raft) sendAppendEntriesToAllPeersForLogEntries(lastLogIndexFromLeader 
 				LogEntries:        rf.logEntries[rf.nextIndex[peerIndex] : lastLogIndexFromLeader + 1],
 				LeaderCommitIndex: rf.commitIndex,
 			}
+			rf.DPrintf(
+
+				"log entries length is %d",
+				len(args.LogEntries))
 			rf.mu.Unlock()
 
 			resp := AppendEntriesReply{
@@ -615,9 +638,6 @@ func (rf *Raft) listen() {
 				go rf.sendAppendEntriesToAllPeersForHeartbeats()
 			}
 			break;
-		case <-rf.requestCh:
-			// time to process request from tester
-
 		}
 	}
 }
@@ -668,7 +688,7 @@ func Make(peers []*labrpc.ClientEnd, me int, applyCh chan ApplyMsg) *Raft {
 	// it is not meant to process events asynchronously, so its buffer size is 1.
 	rf.eventCh = make(chan Event, 1)
 
-	rf.requestCh = applyCh
+	rf.clientCh = applyCh
 
 	go rf.listen()
 
