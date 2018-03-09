@@ -20,3 +20,10 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 func getElectionTimeout() time.Duration {
 	return time.Duration(400+rand.Intn(300)) * time.Millisecond
 }
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}

@@ -62,7 +62,8 @@ type ApplyMsg struct {
 //
 type Log struct {
 	Command interface{}
-	term    int // term when the entry is received by the leader, starts at 1
+	Term    int // term when the entry is received by the leader, starts at 1
+	Position int // position in the log
 }
 
 //
@@ -85,12 +86,15 @@ type Raft struct {
 	// The following are leader related properties
 	status    int   // status of a raft. 0 means follower, 1 means candidate, 2 means leader
 	nextIndex []int // for each server, index of the next log entry to send to that server
-	// initialzed to leader's lasst log index + 1
+	// initialized to leader's last log index + 1
 	matchIndex []int // for each server, index of highest log entry known to be replicated on that server
 	// initialized to zero, increases monotonically
 
 	electionTimer *time.Timer
 	eventCh       chan Event
+
+	// client request channel
+	requestCh     chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -115,6 +119,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  // term number
 	Success bool //true if follower contains log entry matching PrevLogIndex and PrevLogTerm
+	PeerIndex int // index of the raft instance in leader's
+
+	// TODO: we may want to add info for the term of the conflicting entry for later optimization
 }
 
 //
@@ -126,8 +133,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.currentTerm { // This happens when an old failed leader just woke up
 		reply.Success = false
 	} else {
-		rf.eventCh <- Event{Type: EVENT_APPEND_ENTRIES_RECEIVED, Peer: args.LeaderId}
-		reply.Success = true
+		if len(args.LogEntries) == 0 { // this is heartbeat
+			rf.eventCh <- Event{Type: EVENT_APPEND_ENTRIES_RECEIVED, Peer: args.LeaderId}
+			reply.Success = true
+		} else {
+			// check if we have log consistency
+			if args.PrevLogIndex >= len(rf.logEntries) {
+				reply.Success = false
+			} else if args.PrevLogTerm != rf.logEntries[args.PrevLogIndex].Term {
+				reply.Success = false
+			} else {
+				reply.Success = true
+				// append leader's log to its own logs
+				rf.logEntries = append(rf.logEntries, args.LogEntries...)
+				if args.LeaderCommitIndex > rf.commitIndex {
+					rf.commitIndex = min(args.LeaderCommitIndex, len(rf.logEntries) - 1)
+				}
+			}
+		}
 	}
 
 	reply.Term = rf.currentTerm
@@ -283,7 +306,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 }
 
 // Send AppendEntries to all peers and collect results
-func (rf *Raft) sendAppendEntriesToAllPeers() {
+func (rf *Raft) sendAppendEntriesToAllPeersForHeartbeats() {
 	rf.mu.Lock()
 	args := AppendEntriesArgs{
 		Term:              rf.currentTerm,
@@ -379,15 +402,100 @@ func (rf *Raft) DPrintf(format string, a ...interface{}) {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	if rf.status != STATUS_LEADER {
+		return -1, -1, false
+	}
 
-	// Your code here (3B).
-
-	return index, term, isLeader
+	rf.mu.Lock()
+	newLog := Log{Command: command, Term:rf.currentTerm, Position:len(rf.logEntries)}
+	rf.logEntries = append(rf.logEntries, newLog)
+	newLength := len(rf.logEntries)
+	rf.mu.Unlock()
+	go rf.sendAppendEntriesToAllPeersForLogEntries(newLength-1)
+	return newLength-1, rf.currentTerm, true
 }
 
+// Send AppendEntries to all peers and collect results
+func (rf *Raft) sendAppendEntriesToAllPeersForLogEntries(lastLogIndexFromLeader int) {
+	// to send response structure and "ok" flag in a channel,
+	// we need to wrap it in a structure
+	type ResponseMsg struct {
+		AppendEntriesReply
+		IsOk bool
+		Peer int
+		// for debugging purposes - to see how delayed the response was
+		DateSent time.Time
+	}
+	responseChan := make(chan ResponseMsg)
+	rf.DPrintf("sending AppendEntries")
+
+	// Send requests concurrently
+	for i, _ := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+
+		go func(peerIndex int) {
+			rf.mu.Lock()
+			args := AppendEntriesArgs{
+				Term:              rf.currentTerm,
+				LeaderId:          rf.me,
+				PrevLogIndex: lastLogIndexFromLeader - 1,
+				PrevLogTerm:  rf.logEntries[lastLogIndexFromLeader-1].Term,
+				LogEntries:        rf.logEntries[rf.nextIndex[peerIndex] : lastLogIndexFromLeader + 1],
+				LeaderCommitIndex: rf.commitIndex,
+			}
+			rf.mu.Unlock()
+
+			resp := AppendEntriesReply{
+				PeerIndex:peerIndex,
+			}
+			dateSent := time.Now()
+			ok := rf.sendAppendEntries(peerIndex, &args, &resp)
+			responseChan <- ResponseMsg{
+				resp,
+				ok,
+				peerIndex,
+				dateSent,
+			}
+		} (i)
+	}
+
+
+	successCount := 1 // count ourselves
+	failCount := 0
+
+	// collect responses
+	for resp := range responseChan {
+		rf.DPrintf("received AppendEntries response from %d, ok: %t, success: %t, sent at: %s", resp.Peer, resp.IsOk, resp.Success, resp.DateSent.Format(time.StampMicro))
+
+		// no network/host failure AND host agreed to append
+		isOk := resp.IsOk && resp.Success
+
+		if resp.IsOk {
+			// this happens when we just woke up as a previous leader
+			rf.becomeFollowerIfTermIsOlder(resp.Term,  "AppendEntries response")
+		}
+
+		// if enough responses received, send the result on a channel
+		// - don't need to wait for others
+		if isOk {
+			successCount++
+
+			// Update the match index and next index for this particular follower
+			rf.matchIndex[resp.PeerIndex] = rf.nextIndex[resp.PeerIndex]
+			rf.nextIndex[resp.PeerIndex] = rf.nextIndex[resp.PeerIndex] + 1
+
+			if successCount == rf.getMajoritySize() {
+				rf.eventCh <- Event{Type: EVENT_APPEND_ENTRIES_SEND_SUCCESS}
+			}
+		} else {
+			failCount++
+
+			// TODO: We need to handle failure of log consistency here
+		}
+	}
+}
 //
 // the tester calls Kill() when a Raft instance won't
 // be needed again. you are not required to do anything
@@ -412,9 +520,16 @@ func (rf *Raft) BecomeLeader() {
 	if !rf.electionTimer.Stop() {
 		<- rf.electionTimer.C
 	}
+
+	// Initialize all nextIndex values to the next Index the leader will send to followers
+	rf.nextIndex = make([]int, len(rf.peers))
+	for index,_ := range rf.peers {
+		rf.nextIndex[index] = len(rf.logEntries)
+	}
+
 	// send heartbeat immediately without waiting for a ticker
 	// to make sure other peers will not timeout.
-	go rf.sendAppendEntriesToAllPeers()
+	go rf.sendAppendEntriesToAllPeersForHeartbeats()
 }
 
 // Turns current host into candidate
@@ -493,9 +608,12 @@ func (rf *Raft) listen() {
 		case <-heartbeatTicker.C:
 			// time to send a heartbeat
 			if rf.status == STATUS_LEADER {
-				go rf.sendAppendEntriesToAllPeers()
+				go rf.sendAppendEntriesToAllPeersForHeartbeats()
 			}
 			break;
+		case <-rf.requestCh:
+			// time to process request from tester
+
 		}
 	}
 }
@@ -543,6 +661,8 @@ func Make(peers []*labrpc.ClientEnd, me int, applyCh chan ApplyMsg) *Raft {
 	// event channel is used to consolidate business logic in a single function (handleEvent).
 	// it is not meant to process events asynchronously, so its buffer size is 1.
 	rf.eventCh = make(chan Event, 1)
+
+	rf.requestCh = applyCh
 
 	go rf.listen()
 
