@@ -18,5 +18,5 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 
 // Returns a timeout duration a follower is allowed to wait until starting election
 func getElectionTimeout() time.Duration {
-	return time.Duration(400+rand.Intn(400)) * time.Millisecond
+	return time.Duration(400+rand.Intn(300)) * time.Millisecond
 }
