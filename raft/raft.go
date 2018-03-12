@@ -121,8 +121,7 @@ type AppendEntriesReply struct {
 	Term    int  // term number
 	Success bool //true if follower contains log entry matching PrevLogIndex and PrevLogTerm
 	PeerIndex int // index of the raft instance in leader's nextIndex slice
-
-	// TODO: we may want to add info for the term of the conflicting entry for later optimization
+	NextIndex int // Updated nextIndex for the peer
 }
 
 //
@@ -156,6 +155,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				}
 				// append leader's log to its own logs
 				rf.logEntries = append(rf.logEntries, args.LogEntries...)
+				reply.NextIndex = len(rf.logEntries)-1
 			}
 		}
 	}
@@ -522,7 +522,7 @@ func (rf *Raft) broadcastEntries(lastLogIndexFromLeader int) {
 			// Update the match index and next index for this particular follower
 			rf.mu.Lock()
 			fmt.Printf("get success from server %d with command %d\n", resp.PeerIndex, rf.logEntries[len(rf.logEntries) - 1].Command)
-			rf.nextIndex[resp.PeerIndex] = rf.nextIndex[resp.PeerIndex] + 1
+			rf.nextIndex[resp.PeerIndex] = resp.NextIndex
 			rf.matchIndex[resp.PeerIndex] = rf.nextIndex[resp.PeerIndex]
 
 			// Check if we have a new entry that is committed. If so, send to client
@@ -541,7 +541,8 @@ func (rf *Raft) broadcastEntries(lastLogIndexFromLeader int) {
 				if initialCount < rf.getMajoritySize() {
 					break
 				}
-				if initialCount == rf.getMajoritySize() && rf.logEntries[newCommitIndex].Term == rf.currentTerm {
+				// We use <= for term comparison because we are looping through all the old terms
+				if initialCount == rf.getMajoritySize() && rf.logEntries[newCommitIndex].Term <= rf.currentTerm {
 					// NOTE TODO: again we need to increment the commitIndex
 					rf.clientCh <- ApplyMsg{Index: newCommitIndex + 1, Command:rf.logEntries[newCommitIndex].Command}
 					rf.commitIndex = newCommitIndex
@@ -608,12 +609,16 @@ func (rf *Raft) BecomeLeader() {
 	}
 
 	/* Initialize all matchIndex values for all the peers. This is the index of the highest log entry
-	 known to replicated on server. Upon leader election, all matchIndex initialized to zero
-	 */
-	 rf.matchIndex = make([]int, len(rf.peers))
-	 for index, _ := range rf.peers {
-	 	rf.matchIndex[index] = -1
-	 }
+	known to replicated on server. Upon leader election, all matchIndex initialized to zero
+	*/
+	rf.matchIndex = make([]int, len(rf.peers))
+	for index, _ := range rf.peers {
+		if index == rf.me {
+			rf.matchIndex[rf.me] = len(rf.logEntries) - 1
+		} else {
+			rf.matchIndex[index] = -1
+		}
+	}
 	// send heartbeat immediately without waiting for a ticker
 	// to make sure other peers will not timeout.
 	go rf.broadcastHeartbeats()
