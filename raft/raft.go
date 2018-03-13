@@ -200,7 +200,7 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	rf.becomeFollowerIfTermIsOlder(args.Term, fmt.Sprintf("RequestVote request from %d", args.CandidateId))
+	//rf.becomeFollowerIfTermIsOlder(args.Term, fmt.Sprintf("RequestVote request from %d", args.CandidateId))
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -209,6 +209,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if rf.votedFor == 0 { // first check to grant vote is that raft has yet to vote in the term
 		if rf.currentTerm < args.Term { // If a new term starts, grant the vote
+			if rf.status != STATUS_FOLLOWER {
+				rf.status = STATUS_FOLLOWER
+				rf.electionTimer.Reset(getElectionTimeout())
+			}
+
+			rf.currentTerm =args.Term
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
 		} else if rf.currentTerm == args.Term { // if in the same term, whoever has longer log is more up-to-date
@@ -219,8 +225,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 	}
 
-	rf.DPrintf(
-		"received vote request from %d, granted: %t",
+	fmt.Printf(
+		"received vote request from %d, granted: %t\n",
 		args.CandidateId, reply.VoteGranted)
 }
 
@@ -384,6 +390,10 @@ func (rf *Raft) broadcastHeartbeats() {
 		if resp.IsNetworkOK {
 			// this happens when we just woke up as a previous leader
 			rf.becomeFollowerIfTermIsOlder(resp.Term,  "AppendEntries response")
+			// Note TODO: the following check is very important since if a leader converts to follower, he shouldn't be sending RPCs anymore
+			if rf.status == STATUS_FOLLOWER {
+				break;
+			}
 		}
 
 		// if enough responses received, send the result on a channel
@@ -652,9 +662,9 @@ func (rf *Raft) becomeFollowerIfTermIsOlder(term int, comment string) {
 		oldTerm := rf.currentTerm
 		rf.currentTerm = term
 		rf.votedFor = 0
-		rf.DPrintf(
-			"[%s] ELECTION term updated, old: %d. Host is now a follower",
-			comment, oldTerm)
+		fmt.Printf(
+			"[%s] ELECTION term updated, old: %d. Host %d is now a follower ad voted for is %d\n",
+			comment, oldTerm, rf.me, rf.votedFor)
 	}
 }
 // Turns current host into follower and updates its term, if given term is newer.
