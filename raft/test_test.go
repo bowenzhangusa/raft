@@ -153,7 +153,7 @@ func TestFailNoAgree3B(t *testing.T) {
 	cfg.disconnect((leader + 1) % servers)
 	cfg.disconnect((leader + 2) % servers)
 	cfg.disconnect((leader + 3) % servers)
-
+	fmt.Printf("Test (3B): disconnected 3 hosts: %d %d %d\n", (leader + 1) % servers, (leader + 2) % servers, (leader + 3) % servers)
 	index, _, ok := cfg.rafts[leader].Start(20)
 	if ok != true {
 		t.Fatalf("leader rejected Start()")
@@ -161,8 +161,10 @@ func TestFailNoAgree3B(t *testing.T) {
 	if index != 2 {
 		t.Fatalf("expected index 2, got %v", index)
 	}
+	fmt.Printf("BEFORE 2X TIMEOUT\n")
 
 	time.Sleep(2 * RaftElectionTimeout)
+	fmt.Printf("AFTER 2X TIMEOUT\n")
 
 	n, _ := cfg.nCommitted(index)
 	if n > 0 {
@@ -173,7 +175,7 @@ func TestFailNoAgree3B(t *testing.T) {
 	cfg.connect((leader + 1) % servers)
 	cfg.connect((leader + 2) % servers)
 	cfg.connect((leader + 3) % servers)
-
+	fmt.Printf("REPAIRED 3 HOSTS\n")
 	// the disconnected majority may have chosen a leader from
 	// among their own ranks, forgetting index 2.
 	// or perhaps

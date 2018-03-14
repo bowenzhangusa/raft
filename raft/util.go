@@ -8,6 +8,7 @@ import (
 
 // Debugging
 const Debug = 1
+const DebugHeartbeats = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
