@@ -129,6 +129,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	if rf.status == STATUS_CANDIDATE {
+		rf.becomeFollower(
+			args.Term,
+			fmt.Sprintf(
+				"Candidate got heartbeat from %d with term %d, becoming follower",
+				args.LeaderId,
+				args.Term,
+			),
+			false,
+		)
+	}
+
 	if args.Term < rf.currentTerm { // This happens when an old failed leader just woke up
 		reply.Success = false
 		rf.DPrintf("Got heartbeat from %d, failing because RPC term %d is old", args.LeaderId, args.Term)
@@ -167,7 +179,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				reply.NextIndex = len(rf.logEntries) - 1
 				rf.isConsistent = true
 				rf.DPrintf(
-					"AppendEntries applied",
+					"AppendEntries applied from %d, leader term %d, prev log index %d, next index %d",
+					args.LeaderId,
+					args.Term,
+					args.PrevLogIndex,
+					reply.NextIndex,
 				)
 			}
 		}
@@ -223,7 +239,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if rf.votedFor == -1 { // first check to grant vote is that raft has yet to vote in the term
 		selfLastLogTerm := 0
 		if len(rf.logEntries) > 0 {
-			selfLastLogTerm = rf.logEntries[len(rf.logEntries) - 1].Term
+			selfLastLogTerm = rf.logEntries[len(rf.logEntries)-1].Term
 		}
 		if selfLastLogTerm < args.LastLogTerm { // If a new term starts, grant the vote
 			reply.VoteGranted = true
@@ -510,7 +526,7 @@ func (rf *Raft) broadcastEntries(commitIndex int, doneCh chan bool) {
 			continue
 		}
 
-		go rf.catchUpPeer(i, commitIndex, successCh, breakCh)
+		go rf.updatePeer(i, commitIndex, successCh, breakCh)
 	}
 
 	successCount := 1
@@ -551,7 +567,7 @@ func (rf *Raft) broadcastEntries(commitIndex int, doneCh chan bool) {
 	}
 }
 
-func (rf *Raft) catchUpPeer(peer int, newCommit int, successChan chan bool, breakCh chan bool) {
+func (rf *Raft) updatePeer(peer int, latestCommit int, successChan chan bool, breakCh chan bool) {
 	retries := 0
 	for {
 		resp := AppendEntriesReply{PeerIndex: peer}
@@ -574,11 +590,22 @@ func (rf *Raft) catchUpPeer(peer int, newCommit int, successChan chan bool, brea
 			// Update the match index and next index for this particular follower
 			rf.nextIndex[resp.PeerIndex] = resp.NextIndex
 			rf.matchIndex[resp.PeerIndex] = rf.nextIndex[resp.PeerIndex]
+			rf.DPrintf(
+				"AppendEntries to host %d succeeded with cmd %+v; network is ok: %t, next index: %d",
+				resp.PeerIndex,
+				rf.logEntries[rf.nextIndex[resp.PeerIndex]].Command,
+				ok,
+				rf.nextIndex[resp.PeerIndex],
+			)
+			rf.mu.Unlock()
 
-			if resp.NextIndex == newCommit {
-				rf.mu.Unlock()
+			if resp.NextIndex == latestCommit {
 				successChan <- true
-				break
+				return
+			} else if resp.NextIndex > latestCommit {
+				// some other AppendEntries RPC already updated this peer,
+				// nothing else to do here
+				return
 			}
 		} else if ok && !resp.Success {
 			// If it's a log consistency failure, we need to decrement nextIndex for the particular follower and resend log entry
@@ -588,10 +615,11 @@ func (rf *Raft) catchUpPeer(peer int, newCommit int, successChan chan bool, brea
 
 		retries++
 		rf.DPrintf(
-			"\tRetrying AppendEntries to host %d with cmd %+v; network is ok: %t [%d retries]",
+			"\tRetrying AppendEntries to host %d with cmd %+v; network is ok: %t, next index: %d [%d retries]",
 			resp.PeerIndex,
 			rf.logEntries[rf.nextIndex[resp.PeerIndex]].Command,
 			ok,
+			rf.nextIndex[resp.PeerIndex],
 			retries,
 		)
 	}
@@ -756,12 +784,13 @@ func (rf *Raft) runTimers() {
 	}
 }
 
+// this is to send client commands in order,
+// sending next one only after previous is committed
 func (rf *Raft) sendCommands() {
 	for commitIndex := range rf.commandCh {
 		doneCh := make(chan bool, 1)
 		go rf.broadcastEntries(commitIndex, doneCh)
 		<-doneCh
-		rf.DPrintf("ENTRIES BROADCAST DONE")
 	}
 }
 
