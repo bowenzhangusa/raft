@@ -212,7 +212,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 
-	if rf.votedFor == 0 { // first check to grant vote is that raft has yet to vote in the term
+	if rf.votedFor == -1 { // first check to grant vote is that raft has yet to vote in the term
 		if rf.currentTerm < args.Term { // If a new term starts, grant the vote
 			if rf.status != STATUS_FOLLOWER {
 				rf.status = STATUS_FOLLOWER
@@ -606,7 +606,7 @@ func (rf *Raft) BecomeLeader() {
 
 	if rf.status != STATUS_LEADER {
 		rf.status = STATUS_LEADER
-		rf.votedFor = 0
+		rf.votedFor = -1
 		rf.DPrintf("became a leader")
 	}
 
@@ -669,7 +669,7 @@ func (rf *Raft) becomeFollowerIfTermIsOlder(term int, comment string) {
 		}
 		oldTerm := rf.currentTerm
 		rf.currentTerm = term
-		rf.votedFor = 0
+		rf.votedFor = -1
 		fmt.Printf(
 			"[%s] ELECTION term updated, old: %d. Host %d is now a follower ad voted for is %d\n",
 			comment, oldTerm, rf.me, rf.votedFor)
@@ -689,7 +689,7 @@ func (rf *Raft) becomeFollowerIfTermIsOlderOrEqual(term int, comment string) {
 
 		oldTerm := rf.currentTerm
 		rf.currentTerm = term
-		rf.votedFor = 0
+		rf.votedFor = -1
 		rf.electionTimer.Reset(getElectionTimeout())
 		rf.DPrintf(
 
@@ -768,6 +768,7 @@ func Make(peers []*labrpc.ClientEnd, me int, applyCh chan ApplyMsg) *Raft {
 	rf.logEntries = []Log{}
 	rf.commitIndex = -1
 	rf.lastApplied = -1
+	rf.votedFor = -1
 	rf.electionTimer = time.NewTimer(getElectionTimeout())
 	// event channel is used to consolidate business logic in a single function (handleEvent).
 	// it is not meant to process events asynchronously, so its buffer size is 1.
