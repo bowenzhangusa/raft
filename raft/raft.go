@@ -95,6 +95,8 @@ type Raft struct {
 
 	// message channel to client
 	clientCh chan ApplyMsg
+
+	isConsistent  bool // If the instance's log is consistent with the leader
 }
 
 // return currentTerm and whether this server
@@ -144,9 +146,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				"There is a new log with prevLogIndex %d and prevLogTerm %d", args.PrevLogIndex, args.PrevLogTerm)
 			// check if we have log consistency
 			if args.PrevLogIndex >= len(rf.logEntries) {
+				rf.isConsistent = false
 				reply.Success = false
 			} else if args.PrevLogTerm > 0 && args.PrevLogIndex > -1 && args.PrevLogTerm != rf.logEntries[args.PrevLogIndex].Term {
 				reply.Success = false
+				rf.isConsistent = false
 			} else {
 				reply.Success = true
 				// Delete any inconsistent log entries
@@ -156,12 +160,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				// append leader's log to its own logs
 				rf.logEntries = append(rf.logEntries, args.LogEntries...)
 				reply.NextIndex = len(rf.logEntries)-1
+				rf.isConsistent = true
 			}
 		}
 	}
 
 	// Decide if we need to send client commit message
-	if args.LeaderCommitIndex > rf.commitIndex {
+	if args.LeaderCommitIndex > rf.commitIndex && rf.isConsistent{
 		oldCommitIndex := rf.commitIndex + 1
 		rf.commitIndex = min(args.LeaderCommitIndex, len(rf.logEntries) - 1)
 		for oldCommitIndex <= rf.commitIndex {
@@ -629,6 +634,8 @@ func (rf *Raft) BecomeLeader() {
 			rf.matchIndex[index] = -1
 		}
 	}
+
+	rf.isConsistent = true
 	// send heartbeat immediately without waiting for a ticker
 	// to make sure other peers will not timeout.
 	go rf.broadcastHeartbeats()
@@ -657,6 +664,7 @@ func (rf *Raft) becomeFollowerIfTermIsOlder(term int, comment string) {
 		//rf.becomeFollower()
 		if rf.status != STATUS_FOLLOWER {
 			rf.status = STATUS_FOLLOWER
+			rf.isConsistent = false
 			rf.electionTimer.Reset(getElectionTimeout())
 		}
 		oldTerm := rf.currentTerm
@@ -674,7 +682,11 @@ func (rf *Raft) becomeFollowerIfTermIsOlderOrEqual(term int, comment string) {
 	defer rf.mu.Unlock()
 
 	if (rf.currentTerm <= term) { // a new leader sends a heartbeat
-		rf.status = STATUS_FOLLOWER
+		if (rf.status != STATUS_FOLLOWER) {
+			rf.status = STATUS_FOLLOWER
+			rf.isConsistent = false
+		}
+
 		oldTerm := rf.currentTerm
 		rf.currentTerm = term
 		rf.votedFor = 0
@@ -762,6 +774,8 @@ func Make(peers []*labrpc.ClientEnd, me int, applyCh chan ApplyMsg) *Raft {
 	rf.eventCh = make(chan Event, 1)
 
 	rf.clientCh = applyCh
+
+	rf.isConsistent = true
 
 	go rf.listen()
 
