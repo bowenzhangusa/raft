@@ -376,6 +376,9 @@ func (rf *Raft) broadcastHeartbeats() {
 		go func(peerIndex int) {
 			resp := AppendEntriesReply{}
 			dateSent := time.Now()
+			if rf.status != STATUS_LEADER {
+				return
+			}
 			ok := rf.sendAppendEntries(peerIndex, &args, &resp)
 			responseChan <- ResponseMsg{
 				resp,
@@ -510,6 +513,9 @@ func (rf *Raft) broadcastEntries(lastLogIndexFromLeader int) {
 			args, resp := rf.constructArgsForBroadcast(peerIndex)
 			rf.mu.Unlock()
 			dateSent := time.Now()
+			if rf.status != STATUS_LEADER {
+				return
+			}
 			ok := rf.sendAppendEntries(peerIndex, &args, &resp)
 			responseChan <- ResponseMsg{
 				resp,
@@ -581,6 +587,9 @@ func (rf *Raft) broadcastEntries(lastLogIndexFromLeader int) {
 				rf.mu.Unlock()
 
 				dateSent := time.Now()
+				if rf.status != STATUS_LEADER {
+					return
+				}
 				ok := rf.sendAppendEntries(failedFollowerIndex, &appArgs, &appResp)
 
 				responseChan <- ResponseMsg{
