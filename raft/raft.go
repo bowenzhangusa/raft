@@ -213,7 +213,6 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	oldTerm := rf.currentTerm
 	rf.becomeFollowerIfTermIsOlder(args.Term, fmt.Sprintf("RequestVote request from %d", args.CandidateId))
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -222,21 +221,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.VoteGranted = false
 
 	if rf.votedFor == -1 { // first check to grant vote is that raft has yet to vote in the term
-		if oldTerm < args.Term { // If a new term starts, grant the vote
-			if rf.status != STATUS_FOLLOWER {
-				rf.becomeFollower(
-					args.Term,
-					fmt.Sprintf("Got RequestVote with higher term %d", args.Term),
-					true,
-				)
-			} else {
-				rf.currentTerm = args.Term
-			}
-
-			rf.resetElectionTimer()
+		selfLastLogTerm := 0
+		if len(rf.logEntries) > 0 {
+			selfLastLogTerm = rf.logEntries[len(rf.logEntries) - 1].Term
+		}
+		if selfLastLogTerm < args.LastLogTerm { // If a new term starts, grant the vote
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
-		} else if rf.currentTerm == args.Term { // if in the same term, whoever has longer log is more up-to-date
+		} else if selfLastLogTerm == args.LastLogTerm { // if in the same term, whoever has longer log is more up-to-date
 			if len(rf.logEntries) <= args.LastLogIndex+1 {
 				rf.resetElectionTimer()
 				reply.VoteGranted = true
@@ -287,11 +279,17 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // Send RequestVote to all peers and collect results
 func (rf *Raft) sendRequestVoteToAllPeers() {
 	rf.mu.Lock()
+	lastLogTerm := 0
+	lastLogIndex := -1
+	if len(rf.logEntries) > 0 {
+		lastLogIndex = len(rf.logEntries) - 1
+		lastLogTerm = rf.logEntries[lastLogIndex].Term
+	}
 	args := RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
-		LastLogTerm:  rf.currentTerm,
-		LastLogIndex: 0, //TODO
+		LastLogTerm:  lastLogTerm,
+		LastLogIndex: lastLogIndex,
 	}
 	rf.mu.Unlock()
 
@@ -364,8 +362,8 @@ func (rf *Raft) broadcastHeartbeats() {
 		LeaderCommitIndex: rf.commitIndex,
 		LogEntries:        []Log{},
 		IsHeartBeat:       true,
-		PrevLogIndex:      -1,
-		PrevLogTerm:       -1,
+		PrevLogIndex:      0,
+		PrevLogTerm:       0,
 	}
 
 	if len(rf.logEntries) > 0 {
@@ -396,6 +394,9 @@ func (rf *Raft) broadcastHeartbeats() {
 		go func(peerIndex int) {
 			resp := AppendEntriesReply{}
 			dateSent := time.Now()
+			if rf.status != STATUS_LEADER {
+				return
+			}
 			ok := rf.sendAppendEntries(peerIndex, &args, &resp)
 			responseChan <- ResponseMsg{
 				resp,
