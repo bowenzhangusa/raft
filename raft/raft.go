@@ -367,9 +367,9 @@ func (rf *Raft) broadcastHeartbeats() {
 		LeaderId:          rf.me,
 		LeaderCommitIndex: rf.commitIndex,
 		LogEntries:        []Log{},
-		IsHeartBeat:       true,
-		PrevLogIndex:      -1,
-		PrevLogTerm:       -1,
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
+		IsHeartBeat:  true,
 	}
 
 	if len(rf.logEntries) > 0 {
@@ -481,14 +481,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.logEntries = append(rf.logEntries, newLog)
 	rf.nextIndex[rf.me] = len(rf.logEntries) - 1
 	rf.matchIndex[rf.me] = rf.nextIndex[rf.me]
-	//newLength := len(rf.logEntries)
+	newLength := len(rf.logEntries)
 	newCommitIndex := rf.commitIndex + 1
 	rf.lastApplied = len(rf.logEntries) - 1
 
 	rf.DPrintf("\tEnqueueing new command: %+v", command)
 	rf.commandCh <- newCommitIndex
 
-	return newLog.Position, rf.currentTerm, true
+	return newLength, rf.currentTerm, true
 }
 
 func (rf *Raft) constructArgsForBroadcast(peerIndex int) AppendEntriesArgs {
@@ -596,17 +596,19 @@ func (rf *Raft) updatePeer(peer int, latestCommit int, successChan chan bool, br
 			rf.nextIndex[resp.PeerIndex] = resp.NextIndex
 			rf.matchIndex[resp.PeerIndex] = rf.nextIndex[resp.PeerIndex]
 			rf.DPrintf(
-				"AppendEntries to host %d succeeded with cmd %+v; network is ok: %t, next index: %d",
+				"AppendEntries to host %d succeeded with cmd %+v; network is ok: %t, next index: %d, latest commit: %d",
 				resp.PeerIndex,
 				rf.logEntries[rf.nextIndex[resp.PeerIndex]].Command,
 				ok,
 				rf.nextIndex[resp.PeerIndex],
+				latestCommit,
 			)
 
 			if resp.NextIndex == latestCommit {
 				successChan <- true
 				return
 			} else if resp.NextIndex > latestCommit {
+				successChan <- true
 				// some other AppendEntries RPC already updated this peer,
 				// nothing else to do here
 				return
