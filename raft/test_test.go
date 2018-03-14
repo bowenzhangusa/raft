@@ -130,7 +130,7 @@ func TestFailAgree3B(t *testing.T) {
 
 	// re-connect
 	cfg.connect((leader + 1) % servers)
-	fmt.Printf("CHecking with reconnected server\n")
+	fmt.Printf("CHecking with reconnected server %d\n", (leader + 1) % servers)
 	// agree with full set of servers?
 	cfg.one(106, servers)
 	time.Sleep(RaftElectionTimeout)
