@@ -135,6 +135,7 @@ func TestFailAgree3B(t *testing.T) {
 	cfg.one(106, servers)
 	fmt.Printf("106 DONE\n")
 	time.Sleep(RaftElectionTimeout)
+	fmt.Printf("107 start\n")
 	cfg.one(107, servers)
 
 	fmt.Printf("  ... Passed\n")
@@ -205,28 +206,37 @@ func TestRejoin3B(t *testing.T) {
 
 	// leader network failure
 	leader1 := cfg.checkOneLeader()
+	fmt.Printf("Test (3B): disconnect leader %d\n", leader1)
 	cfg.disconnect(leader1)
 
+	fmt.Printf("Test (3B): 3 commands start\n")
 	// make old leader try to agree on some entries
 	cfg.rafts[leader1].Start(102)
 	cfg.rafts[leader1].Start(103)
 	cfg.rafts[leader1].Start(104)
 
+	fmt.Printf("Test (3B): Wait for cmd 103\n")
 	// new leader commits, also for index=2
 	cfg.one(103, 2)
 
+	fmt.Printf("Test (3B): check 1 leader\n")
 	// new leader network failure
 	leader2 := cfg.checkOneLeader()
+	fmt.Printf("Test (3B): disconnect leader %d\n", leader2)
 	cfg.disconnect(leader2)
 
+	fmt.Printf("Test (3B): connect leader %d\n", leader1)
 	// old leader connected again
 	cfg.connect(leader1)
 
+	fmt.Printf("Test (3B): wait for cmd 104\n")
 	cfg.one(104, 2)
 
 	// all together now
+	fmt.Printf("Test (3B): connect leader %d\n", leader2)
 	cfg.connect(leader2)
 
+	fmt.Printf("Test (3B): wait for cmd 105\n")
 	cfg.one(105, servers)
 
 	fmt.Printf("  ... Passed\n")

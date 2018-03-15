@@ -139,13 +139,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.isConsistent = false
 				reply.Success = false
 				rf.DPrintf(
-					"AppendEntries HB rejected because RPC prevLogIndex is >= host logEntries length",
+					"AppendEntries HB rejected because RPC prevLogIndex %d is >= host logEntries length %d",
+					args.PrevLogIndex,
+					len(rf.logEntries),
 				)
 			} else if args.PrevLogTerm > 0 && args.PrevLogIndex > -1 && args.PrevLogTerm != rf.logEntries[args.PrevLogIndex].Term {
 				reply.Success = false
 				rf.isConsistent = false
 				rf.DPrintf(
-					"AppendEntries HB rejected because RPC prevLogIndex does not match host prevLogEntry term",
+					"AppendEntries HB rejected because RPC prevLogIndex %d does not match host prevLogEntry term %d",
+					args.PrevLogIndex,
+					rf.logEntries[args.PrevLogIndex].Term,
 				)
 			} else {
 				rf.resetElectionTimer()
@@ -186,12 +190,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				reply.NextIndex = len(rf.logEntries) - 1
 				rf.isConsistent = true
 				rf.DPrintf(
-					"AppendEntries applied from %d, leader term %d, prev log index %d, next index %d, %d new entries added. Leader ci %d, my ci %d",
+					"AppendEntries applied from %d, leader term %d, prev log index %d, next index %d, %d new entries added, my entries len %d. Leader ci %d, my ci %d",
 					args.LeaderId,
 					args.Term,
 					args.PrevLogIndex,
 					reply.NextIndex,
 					len(args.LogEntries),
+					len(rf.logEntries),
 					args.LeaderCommitIndex,
 					rf.commitIndex,
 				)
@@ -201,10 +206,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// Decide if we need to send client commit message
 	if reply.Success && args.LeaderCommitIndex > rf.commitIndex && rf.isConsistent {
-		rf.DPrintf("Before follower commit: leader ci %d, my ci %d, is cons %t", args.LeaderCommitIndex, rf.commitIndex, rf.isConsistent)
-
 		oldCommitIndex := rf.commitIndex + 1
 		rf.commitIndex = min(args.LeaderCommitIndex, len(rf.logEntries)-1)
+		rf.DPrintf("Follower commit: leader ci %d, my ci %d, old ci %d, my entries len %d, is hb: %t", args.LeaderCommitIndex, rf.commitIndex, oldCommitIndex, len(rf.logEntries), args.IsHeartBeat)
 		for oldCommitIndex <= rf.commitIndex {
 			if oldCommitIndex >= 0 {
 				// NOTE TODO: Normally, we will send index in our slice/array. However, log entries in actual raft
@@ -271,7 +275,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 					"granting vote to %d because candidate has >= log entries: my %d, its %d",
 					args.CandidateId,
 					len(rf.logEntries),
-					args.LastLogIndex + 1,
+					args.LastLogIndex+1,
 				)
 			}
 		}
@@ -337,6 +341,8 @@ func (rf *Raft) sendRequestVoteToAllPeers() {
 		RequestVoteReply
 		IsOk bool
 	}
+
+	startTerm := rf.currentTerm
 	responseChan := make(chan ResponseMsg)
 	rf.DPrintf("sending RequestVote")
 
@@ -361,7 +367,7 @@ func (rf *Raft) sendRequestVoteToAllPeers() {
 
 	// collect responses
 	for resp := range responseChan {
-		if !resp.IsOk {
+		if !resp.IsOk || rf.currentTerm != startTerm {
 			continue
 		}
 
@@ -446,15 +452,15 @@ func (rf *Raft) broadcastHeartbeats() {
 
 	// collect responses
 	for resp := range responseChan {
-		//if DebugHeartbeats > 0 {
-		rf.DPrintf(
-			"received heartbeat response from %d, ok: %t, success: %t, sent at: %s",
-			resp.Peer,
-			resp.IsNetworkOK,
-			resp.Success,
-			resp.DateSent.Format(time.StampMicro),
-		)
-		//}
+		if DebugHeartbeats > 0 {
+			rf.DPrintf(
+				"received heartbeat response from %d, ok: %t, success: %t, sent at: %s",
+				resp.Peer,
+				resp.IsNetworkOK,
+				resp.Success,
+				resp.DateSent.Format(time.StampMicro),
+			)
+		}
 
 		if resp.IsNetworkOK {
 			// this happens when we just woke up as a previous leader
@@ -465,7 +471,7 @@ func (rf *Raft) broadcastHeartbeats() {
 			}
 
 			if !resp.Success {
-				rf.DPrintf("\tUpdating follower after heartbeat response to cmd index=%d v=%+v", rf.lastApplied, rf.logEntries[rf.lastApplied].Command)
+				rf.DPrintf("\tUpdating follower %d after heartbeat response to cmd index=%d v=%+v", resp.PeerIndex, rf.lastApplied, rf.logEntries[rf.lastApplied].Command)
 				go rf.updatePeer(resp.PeerIndex, rf.lastApplied)
 			}
 		}
@@ -520,38 +526,49 @@ func (rf *Raft) DPrintf(format string, a ...interface{}) {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	if rf.status != STATUS_LEADER {
 		return -1, -1, false
 	}
+
+	rf.mu.Lock()
 	newLog := Log{Command: command, Term: rf.currentTerm, Position: len(rf.logEntries)}
 	rf.logEntries = append(rf.logEntries, newLog)
 	rf.nextIndex[rf.me] = len(rf.logEntries) - 1
 	rf.matchIndex[rf.me] = rf.nextIndex[rf.me]
 	newLength := len(rf.logEntries)
-	newCommitIndex := rf.commitIndex + 1
+	//newCommitIndex := rf.commitIndex + 1
 	rf.lastApplied = len(rf.logEntries) - 1
 
 	rf.DPrintf("\tEnqueueing new command: %+v", command)
-	rf.commandCh <- newCommitIndex
+	la := rf.lastApplied
+	rf.commandCh <- la
+	rf.mu.Unlock()
+	rf.DPrintf("\tReturn from start with cmd %+v", command)
 
 	return newLength, rf.currentTerm, true
 }
 
-func (rf *Raft) constructArgsForBroadcast(peerIndex int) AppendEntriesArgs {
+func (rf *Raft) constructArgsForBroadcast(peerIndex int, maxEntryIndex int) AppendEntriesArgs {
 	prevLogTerm := 0
 	prevLogIndex := rf.nextIndex[peerIndex]
 	if prevLogIndex >= 0 {
 		prevLogTerm = rf.logEntries[prevLogIndex].Term
+	}
+
+	var entriesToSend []Log
+
+	if prevLogIndex+1 <= maxEntryIndex+1 {
+		entriesToSend = rf.logEntries[prevLogIndex+1: maxEntryIndex+1]
+	} else {
+		// when we want to send follower an entry that was already accepted by it - no need to do anything
+		/*rf.DPrintf("Lo %d, hi %d, len %d", prevLogIndex+1, maxEntryIndex+1, len(rf.logEntries))*/
 	}
 	args := AppendEntriesArgs{
 		Term:              rf.currentTerm,
 		LeaderId:          rf.me,
 		PrevLogIndex:      prevLogIndex,
 		PrevLogTerm:       prevLogTerm,
-		LogEntries:        rf.logEntries[prevLogIndex+1: len(rf.logEntries)],
+		LogEntries:        entriesToSend,
 		LeaderCommitIndex: rf.commitIndex,
 		IsHeartBeat:       false,
 	}
@@ -560,12 +577,20 @@ func (rf *Raft) constructArgsForBroadcast(peerIndex int) AppendEntriesArgs {
 }
 
 // Send AppendEntries to all peers and collect results
-func (rf *Raft) broadcastEntries(commitIndex int) {
+func (rf *Raft) broadcastEntries(entryIndex int) {
+	if rf.status != STATUS_LEADER {
+		rf.DPrintf(
+			"skipping BroadcastEntries because host is not a leader",
+		)
+		rf.cmdDoneCh <- true
+		return
+	}
+
 	rf.resetHeartbeatTimer()
 	rf.DPrintf(
-		"sending AppendEntries for new commit index %d, cmd %+v",
-		commitIndex,
-		rf.logEntries[commitIndex].Command,
+		"sending AppendEntries for entry %d, cmd %+v",
+		entryIndex,
+		rf.logEntries[entryIndex].Command,
 	)
 
 	// Send requests concurrently
@@ -574,16 +599,23 @@ func (rf *Raft) broadcastEntries(commitIndex int) {
 			continue
 		}
 
-		go rf.updatePeer(i, commitIndex)
+		go rf.updatePeer(i, entryIndex)
 	}
 }
 
-// Sends AppendEntries to peer until its index becomes >= latestCommit
-func (rf *Raft) updatePeer(peer int, latestCommit int) {
+// Sends AppendEntries to peer until its index becomes >= entryIndex
+func (rf *Raft) updatePeer(peer int, entryIndex int) {
 	retries := 0
 	for {
 		resp := AppendEntriesReply{PeerIndex: peer}
-		args := rf.constructArgsForBroadcast(resp.PeerIndex)
+		rf.mu.Lock()
+		args := rf.constructArgsForBroadcast(resp.PeerIndex, entryIndex)
+		rf.mu.Unlock()
+		rf.DPrintf(
+			"Sending AppendEntries to %d with %d entries",
+			resp.PeerIndex,
+			len(args.LogEntries),
+		)
 		ok := rf.sendAppendEntries(peer, &args, &resp)
 
 		if ok {
@@ -592,8 +624,11 @@ func (rf *Raft) updatePeer(peer int, latestCommit int) {
 		}
 
 		if rf.status != STATUS_LEADER {
+			rf.DPrintf(
+				"Exiting UpdatePeer because host is not a leader any more",
+			)
 			rf.cmdDoneCh <- true
-			break
+			return
 		}
 
 		if ok && resp.Success {
@@ -602,46 +637,51 @@ func (rf *Raft) updatePeer(peer int, latestCommit int) {
 			rf.nextIndex[resp.PeerIndex] = resp.NextIndex
 			rf.matchIndex[resp.PeerIndex] = rf.nextIndex[resp.PeerIndex]
 			rf.DPrintf(
-				"AppendEntries to host %d succeeded with cmd %+v; network is ok: %t, next index: %d, latest commit: %d",
+				"AppendEntries to host %d succeeded with entry index %d; next index: %d, ",
 				resp.PeerIndex,
-				rf.logEntries[rf.nextIndex[resp.PeerIndex]].Command,
-				ok,
+				entryIndex,
 				rf.nextIndex[resp.PeerIndex],
-				latestCommit,
 			)
 
-			if resp.NextIndex >= latestCommit {
+			if resp.NextIndex >= entryIndex {
 				successCount := 0
 				for i, _ := range rf.peers {
-					if rf.matchIndex[i] >= latestCommit {
+					if rf.matchIndex[i] >= entryIndex {
 						successCount++
 					}
 				}
 
-				rf.DPrintf("Success count for commit %d: %d", latestCommit, successCount)
+				rf.DPrintf("Success count for entry %d: %d", entryIndex, successCount)
 
-				if successCount >= rf.getMajoritySize() && rf.commitIndex < latestCommit {
-					// NOTE TODO: again we need to increment the commitIndex
-					rf.DPrintf(
-						"\tCommitting cmd %+v with index %d",
-						rf.logEntries[latestCommit].Command,
-						latestCommit,
-					)
-					rf.clientCh <- ApplyMsg{
-						Index:   latestCommit + 1,
-						Command: rf.logEntries[latestCommit].Command,
-					}
-					rf.commitIndex = latestCommit
+				if successCount >= rf.getMajoritySize() {
+					if rf.commitIndex < entryIndex {
+						// NOTE TODO: again we need to increment the commitIndex
+						rf.DPrintf(
+							"\tCommitting cmd %+v with index %d",
+							rf.logEntries[entryIndex].Command,
+							entryIndex,
+						)
+						rf.clientCh <- ApplyMsg{
+							Index:   entryIndex + 1,
+							Command: rf.logEntries[entryIndex].Command,
+						}
+						rf.commitIndex = entryIndex
 
-					if rf.commitIndex > rf.lastApplied {
-						rf.DPrintf("\t\t!!!!!!Commit index %d > last applied %d", rf.commitIndex, rf.lastApplied)
-						// TODO
+						if rf.commitIndex > rf.lastApplied {
+							rf.DPrintf("\t\t!!!!!!Commit index %d > last applied %d", rf.commitIndex, rf.lastApplied)
+							// TODO
+						}
 					}
+
+					// this peer accepted entry, and it formed a majority
+					rf.mu.Unlock()
+					rf.cmdDoneCh <- true
+					return
+				} else {
+					// this peer accepted entry, but there is no majority yet
+					rf.mu.Unlock()
+					return
 				}
-
-				rf.mu.Unlock()
-				rf.cmdDoneCh <- true
-				return
 			}
 			rf.mu.Unlock()
 		} else if ok && !resp.Success {
@@ -679,24 +719,11 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 }
 
-// Turns current host into leader
-func (rf *Raft) BecomeLeader() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	if rf.status != STATUS_LEADER {
-		rf.status = STATUS_LEADER
-		rf.votedFor = -1
-	}
-
-	if !rf.electionTimer.Stop() {
-		<-rf.electionTimer.C
-	}
+func (rf *Raft) clearPeerInfo() {
 
 	/* Initialize all nextIndex values to the next Index the leader will send to followers
 	And the nextIndex the leader will send to a follower is the index of the latest known replicated entry
 	so that the follower can use the index to check against its own log */
-	rf.DPrintf("server %d becomes new leader with log entry length %d", rf.me, len(rf.logEntries))
 	rf.nextIndex = make([]int, len(rf.peers))
 	for index, _ := range rf.peers {
 		rf.nextIndex[index] = len(rf.logEntries) - 1
@@ -713,8 +740,25 @@ func (rf *Raft) BecomeLeader() {
 			rf.matchIndex[index] = -1
 		}
 	}
+}
 
-	rf.lastApplied = len(rf.logEntries) - 1
+// Turns current host into leader
+func (rf *Raft) BecomeLeader() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.status != STATUS_LEADER {
+		rf.status = STATUS_LEADER
+	}
+
+	rf.votedFor = -1
+
+	if !rf.electionTimer.Stop() {
+		<-rf.electionTimer.C
+	}
+	rf.DPrintf("server %d becomes new leader with log entry length %d", rf.me, len(rf.logEntries))
+	rf.clearPeerInfo()
+
 	rf.isConsistent = true
 	// send heartbeat immediately without waiting for a ticker
 	// to make sure other peers will not timeout.
@@ -727,6 +771,7 @@ func (rf *Raft) BecomeCandidate() {
 	defer rf.mu.Unlock()
 
 	rf.status = STATUS_CANDIDATE
+	//rf.clearPeerInfo()
 	rf.currentTerm++
 	rf.DPrintf("start leader election with term %d server %d", rf.currentTerm, rf.me)
 	rf.votedFor = rf.me
@@ -769,6 +814,8 @@ func (rf *Raft) becomeFollower(newTerm int, comment string, lock bool) {
 		rf.status = STATUS_FOLLOWER
 		statusUpdated = true
 	}
+
+	//rf.clearPeerInfo()
 
 	rf.votedFor = -1
 
@@ -831,9 +878,12 @@ func (rf *Raft) runTimers() {
 // this is to send client commands in order,
 // sending next one only after previous is committed
 func (rf *Raft) sendCommands() {
-	for commitIndex := range rf.commandCh {
-		go rf.broadcastEntries(commitIndex)
+	for entryIndex := range rf.commandCh {
+		rf.DPrintf("\t\tNEW CMD DEQ")
+		go rf.broadcastEntries(entryIndex)
+		rf.DPrintf("\t\tWAITING CMD")
 		<-rf.cmdDoneCh
+		rf.DPrintf("\t\tCMD DONE")
 	}
 }
 
@@ -859,7 +909,7 @@ func Make(peers []*labrpc.ClientEnd, me int, applyCh chan ApplyMsg) *Raft {
 	rf.electionTimer = time.NewTimer(getElectionTimeout())
 	rf.heartbeatTimer = time.NewTimer(HEARTBEAT_FREQUENCY)
 	rf.clientCh = applyCh
-	rf.commandCh = make(chan int)
+	rf.commandCh = make(chan int, 100)
 	rf.cmdDoneCh = make(chan bool)
 	rf.isConsistent = true
 
