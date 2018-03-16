@@ -7,7 +7,8 @@ import (
 )
 
 // Debugging
-const Debug = 0
+const Debug = 1
+// Heartbeats account for a majority of logs, so we enable them separately
 const DebugHeartbeats = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
