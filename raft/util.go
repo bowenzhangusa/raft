@@ -7,7 +7,7 @@ import (
 )
 
 // Debugging
-const Debug = 1
+const Debug = 0
 // Heartbeats account for a majority of logs, so we enable them separately
 const DebugHeartbeats = 0
 
