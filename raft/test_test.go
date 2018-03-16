@@ -256,59 +256,72 @@ func TestBackup3B(t *testing.T) {
 	cfg.disconnect((leader1 + 2) % servers)
 	cfg.disconnect((leader1 + 3) % servers)
 	cfg.disconnect((leader1 + 4) % servers)
-
+	fmt.Printf("Test (3B): disconnected 3 hosts: %d %d %d\n", (leader1 + 2) % servers, (leader1 + 3) % servers, (leader1 + 4) % servers)
 	// submit lots of commands that won't commit
 	for i := 0; i < 50; i++ {
 		cfg.rafts[leader1].Start(rand.Int())
 	}
 
+	fmt.Printf("Test (3B): sleeping / 2\n")
 	time.Sleep(RaftElectionTimeout / 2)
 
 	cfg.disconnect((leader1 + 0) % servers)
 	cfg.disconnect((leader1 + 1) % servers)
+	fmt.Printf("Test (3B): disconnected 2 hosts: %d %d\n", (leader1 + 0) % servers, (leader1 + 1) % servers)
 
 	// allow other partition to recover
 	cfg.connect((leader1 + 2) % servers)
 	cfg.connect((leader1 + 3) % servers)
 	cfg.connect((leader1 + 4) % servers)
 
+	fmt.Printf("Test (3B): connected 3 hosts: %d %d %d\n", (leader1 + 2) % servers, (leader1 + 3) % servers, (leader1 + 4) % servers)
+
 	// lots of successful commands to new group.
 	for i := 0; i < 50; i++ {
 		cfg.one(rand.Int(), 3)
 	}
 
+	fmt.Printf("Test (3B): check 1 leader\n")
 	// now another partitioned leader and one follower
 	leader2 := cfg.checkOneLeader()
 	other := (leader1 + 2) % servers
 	if leader2 == other {
 		other = (leader2 + 1) % servers
 	}
+	fmt.Printf("Test (3B): disconnect %d\n", other)
 	cfg.disconnect(other)
-
+	fmt.Printf("Test (3B): lots more commands that won't commit\n")
 	// lots more commands that won't commit
 	for i := 0; i < 50; i++ {
 		cfg.rafts[leader2].Start(rand.Int())
 	}
 
+	fmt.Printf("Test (3B): sleep / 2\n")
 	time.Sleep(RaftElectionTimeout / 2)
 
 	// bring original leader back to life,
 	for i := 0; i < servers; i++ {
 		cfg.disconnect(i)
+		fmt.Printf("Test (3B): disconnect %d\n", i)
 	}
+
+	fmt.Printf("Test (3B): connecting %d %d %d\n", (leader1 + 0) % servers, (leader1 + 1) % servers, other)
 	cfg.connect((leader1 + 0) % servers)
 	cfg.connect((leader1 + 1) % servers)
 	cfg.connect(other)
 
+	fmt.Printf("Test (3B): lots of successful commands to new group.\n")
 	// lots of successful commands to new group.
 	for i := 0; i < 50; i++ {
 		cfg.one(rand.Int(), 3)
 	}
 
+	fmt.Printf("Test (3B): now everyone\n")
 	// now everyone
 	for i := 0; i < servers; i++ {
 		cfg.connect(i)
 	}
+	fmt.Printf("Test (3B): last one\n")
 	cfg.one(rand.Int(), servers)
 
 	fmt.Printf("  ... Passed\n")

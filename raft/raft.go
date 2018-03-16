@@ -132,6 +132,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		rf.DPrintf("Got AppendEntries from %d, failing because RPC term %d is old", args.LeaderId, args.Term)
 	} else {
+		rf.resetElectionTimer()
 		// check if we have log consistency
 		if args.PrevLogIndex >= len(rf.logEntries) {
 			reply.Success = false
@@ -144,7 +145,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				"AppendEntries rejected because RPC prevLogIndex does not match host prevLogEntry term",
 			)
 		} else {
-			rf.resetElectionTimer()
 			reply.Success = true
 
 			if len(args.LogEntries) > 0 {
@@ -475,7 +475,13 @@ func (rf *Raft) DPrintf(format string, a ...interface{}) {
 	}
 
 	// a race condition might appear while collecting log info,
-	// but this is not critical for the functionality
+	// but this is not critical for the functionality, so we ignore it
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("[i%d] Error while logging %s: %s\n", rf.me, format, r)
+		}
+	}()
+
 	var lastAppliedCmd interface{}
 	var lastCommittedCmd interface{}
 
@@ -503,7 +509,7 @@ func (rf *Raft) DPrintf(format string, a ...interface{}) {
 		a...,
 	)
 	// Log format:
-	// [host_index status term log_length committed_cmd_index/value applied_cmd_inndex/value]
+	// [host_index status term log_length committed_cmd_index/value applied_cmd_index/value]
 	log.Printf("\t[i%d s%d t%d l%d cmd-comm:%d/%+v cmd-app:%d/%v] "+format, args...)
 }
 
@@ -616,15 +622,15 @@ func (rf *Raft) updatePeer(peer int, entryIndex int) {
 	retries := 0
 	rf.updatingPeers[peer] = true
 	for {
-		resp := AppendEntriesReply{PeerIndex: peer}
 		rf.mu.Lock()
+		resp := AppendEntriesReply{PeerIndex: peer}
 		args := rf.constructArgsForBroadcast(resp.PeerIndex, entryIndex)
-		rf.mu.Unlock()
 		rf.DPrintf(
 			"Sending AppendEntries to %d with %d entries",
 			resp.PeerIndex,
 			len(args.LogEntries),
 		)
+		rf.mu.Unlock()
 		ok := rf.sendAppendEntries(peer, &args, &resp)
 
 		if ok {
