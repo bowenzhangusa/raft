@@ -130,10 +130,12 @@ func TestFailAgree3B(t *testing.T) {
 
 	// re-connect
 	cfg.connect((leader + 1) % servers)
-	fmt.Printf("CHecking with reconnected server\n")
+	fmt.Printf("CHecking with reconnected server %d\n", (leader + 1) % servers)
 	// agree with full set of servers?
 	cfg.one(106, servers)
+	fmt.Printf("106 DONE\n")
 	time.Sleep(RaftElectionTimeout)
+	fmt.Printf("107 start\n")
 	cfg.one(107, servers)
 
 	fmt.Printf("  ... Passed\n")
@@ -153,7 +155,7 @@ func TestFailNoAgree3B(t *testing.T) {
 	cfg.disconnect((leader + 1) % servers)
 	cfg.disconnect((leader + 2) % servers)
 	cfg.disconnect((leader + 3) % servers)
-
+	fmt.Printf("Test (3B): disconnected 3 hosts: %d %d %d\n", (leader + 1) % servers, (leader + 2) % servers, (leader + 3) % servers)
 	index, _, ok := cfg.rafts[leader].Start(20)
 	if ok != true {
 		t.Fatalf("leader rejected Start()")
@@ -161,8 +163,10 @@ func TestFailNoAgree3B(t *testing.T) {
 	if index != 2 {
 		t.Fatalf("expected index 2, got %v", index)
 	}
+	fmt.Printf("BEFORE 2X TIMEOUT\n")
 
 	time.Sleep(2 * RaftElectionTimeout)
+	fmt.Printf("AFTER 2X TIMEOUT\n")
 
 	n, _ := cfg.nCommitted(index)
 	if n > 0 {
@@ -173,7 +177,7 @@ func TestFailNoAgree3B(t *testing.T) {
 	cfg.connect((leader + 1) % servers)
 	cfg.connect((leader + 2) % servers)
 	cfg.connect((leader + 3) % servers)
-
+	fmt.Printf("REPAIRED 3 HOSTS\n")
 	// the disconnected majority may have chosen a leader from
 	// among their own ranks, forgetting index 2.
 	// or perhaps
@@ -202,28 +206,37 @@ func TestRejoin3B(t *testing.T) {
 
 	// leader network failure
 	leader1 := cfg.checkOneLeader()
+	fmt.Printf("Test (3B): disconnect leader %d\n", leader1)
 	cfg.disconnect(leader1)
 
+	fmt.Printf("Test (3B): 3 commands start\n")
 	// make old leader try to agree on some entries
 	cfg.rafts[leader1].Start(102)
 	cfg.rafts[leader1].Start(103)
 	cfg.rafts[leader1].Start(104)
 
+	fmt.Printf("Test (3B): Wait for cmd 103\n")
 	// new leader commits, also for index=2
 	cfg.one(103, 2)
 
+	fmt.Printf("Test (3B): check 1 leader\n")
 	// new leader network failure
 	leader2 := cfg.checkOneLeader()
+	fmt.Printf("Test (3B): disconnect leader %d\n", leader2)
 	cfg.disconnect(leader2)
 
+	fmt.Printf("Test (3B): connect leader %d\n", leader1)
 	// old leader connected again
 	cfg.connect(leader1)
 
+	fmt.Printf("Test (3B): wait for cmd 104\n")
 	cfg.one(104, 2)
 
 	// all together now
+	fmt.Printf("Test (3B): connect leader %d\n", leader2)
 	cfg.connect(leader2)
 
+	fmt.Printf("Test (3B): wait for cmd 105\n")
 	cfg.one(105, servers)
 
 	fmt.Printf("  ... Passed\n")
@@ -243,59 +256,72 @@ func TestBackup3B(t *testing.T) {
 	cfg.disconnect((leader1 + 2) % servers)
 	cfg.disconnect((leader1 + 3) % servers)
 	cfg.disconnect((leader1 + 4) % servers)
-
+	fmt.Printf("Test (3B): disconnected 3 hosts: %d %d %d\n", (leader1 + 2) % servers, (leader1 + 3) % servers, (leader1 + 4) % servers)
 	// submit lots of commands that won't commit
 	for i := 0; i < 50; i++ {
 		cfg.rafts[leader1].Start(rand.Int())
 	}
 
+	fmt.Printf("Test (3B): sleeping / 2\n")
 	time.Sleep(RaftElectionTimeout / 2)
 
 	cfg.disconnect((leader1 + 0) % servers)
 	cfg.disconnect((leader1 + 1) % servers)
+	fmt.Printf("Test (3B): disconnected 2 hosts: %d %d\n", (leader1 + 0) % servers, (leader1 + 1) % servers)
 
 	// allow other partition to recover
 	cfg.connect((leader1 + 2) % servers)
 	cfg.connect((leader1 + 3) % servers)
 	cfg.connect((leader1 + 4) % servers)
 
+	fmt.Printf("Test (3B): connected 3 hosts: %d %d %d\n", (leader1 + 2) % servers, (leader1 + 3) % servers, (leader1 + 4) % servers)
+
 	// lots of successful commands to new group.
 	for i := 0; i < 50; i++ {
 		cfg.one(rand.Int(), 3)
 	}
 
+	fmt.Printf("Test (3B): check 1 leader\n")
 	// now another partitioned leader and one follower
 	leader2 := cfg.checkOneLeader()
 	other := (leader1 + 2) % servers
 	if leader2 == other {
 		other = (leader2 + 1) % servers
 	}
+	fmt.Printf("Test (3B): disconnect %d\n", other)
 	cfg.disconnect(other)
-
+	fmt.Printf("Test (3B): lots more commands that won't commit\n")
 	// lots more commands that won't commit
 	for i := 0; i < 50; i++ {
 		cfg.rafts[leader2].Start(rand.Int())
 	}
 
+	fmt.Printf("Test (3B): sleep / 2\n")
 	time.Sleep(RaftElectionTimeout / 2)
 
 	// bring original leader back to life,
 	for i := 0; i < servers; i++ {
 		cfg.disconnect(i)
+		fmt.Printf("Test (3B): disconnect %d\n", i)
 	}
+
+	fmt.Printf("Test (3B): connecting %d %d %d\n", (leader1 + 0) % servers, (leader1 + 1) % servers, other)
 	cfg.connect((leader1 + 0) % servers)
 	cfg.connect((leader1 + 1) % servers)
 	cfg.connect(other)
 
+	fmt.Printf("Test (3B): lots of successful commands to new group.\n")
 	// lots of successful commands to new group.
 	for i := 0; i < 50; i++ {
 		cfg.one(rand.Int(), 3)
 	}
 
+	fmt.Printf("Test (3B): now everyone\n")
 	// now everyone
 	for i := 0; i < servers; i++ {
 		cfg.connect(i)
 	}
+	fmt.Printf("Test (3B): last one\n")
 	cfg.one(rand.Int(), servers)
 
 	fmt.Printf("  ... Passed\n")
