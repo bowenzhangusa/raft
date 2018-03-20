@@ -108,7 +108,6 @@ type AppendEntriesArgs struct {
 	PrevLogTerm       int   // term of prevLogIndex entry
 	LogEntries        []Log //log entries to store. For heartbeat, this is empty. May send more than one for efficiency
 	LeaderCommitIndex int
-	IsHeartBeat       bool
 }
 
 // example AppendEntriesRPC reply structure
@@ -379,7 +378,6 @@ func (rf *Raft) broadcastHeartbeats() {
 		LeaderCommitIndex: rf.commitIndex,
 		LogEntries:        []Log{},
 		PrevLogTerm:       0,
-		IsHeartBeat:       true,
 	}
 
 	// to send response structure and "ok" flag in a channel,
@@ -570,7 +568,6 @@ func (rf *Raft) constructArgsForBroadcast(peerIndex int, maxEntryIndex int) Appe
 		PrevLogTerm:       prevLogTerm,
 		LogEntries:        entriesToSend,
 		LeaderCommitIndex: rf.commitIndex,
-		IsHeartBeat:       false,
 	}
 
 	return args
