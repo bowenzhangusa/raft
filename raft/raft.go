@@ -539,7 +539,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	rf.DPrintf("\tEnqueueing new command: %+v", command)
 	rf.mu.Unlock()
-	rf.broadcastEntries(rf.lastApplied)
+	rf.enqueueEntryBroadcast(rf.lastApplied)
 
 	return newLength, rf.currentTerm, true
 }
@@ -573,17 +573,17 @@ func (rf *Raft) constructArgsForBroadcast(peerIndex int, maxEntryIndex int) Appe
 	return args
 }
 
-// Send AppendEntries to all peers and collect results
-func (rf *Raft) broadcastEntries(entryIndex int) {
+// Enqueue AppendEntries command for all peers
+func (rf *Raft) enqueueEntryBroadcast(entryIndex int) {
 	if rf.status != STATUS_LEADER {
 		rf.DPrintf(
-			"skipping BroadcastEntries because host is not a leader",
+			"skipping AppendEntries because host is not a leader",
 		)
 		return
 	}
 
 	rf.DPrintf(
-		"sending AppendEntries for entry %d, cmd %+v",
+		"enqueueing AppendEntries for entry %d, cmd %+v",
 		entryIndex,
 		rf.logEntries[entryIndex].Command,
 	)
@@ -598,7 +598,7 @@ func (rf *Raft) broadcastEntries(entryIndex int) {
 	}
 }
 
-// Sends entries to peers, as they appear in the command channel
+// Sends entries to peers, as they appear in the update channel
 func (rf *Raft) updatePeersInBackground() {
 	for i, _ := range rf.peerUpdates {
 		go func(peer int) {
@@ -738,7 +738,7 @@ func (rf *Raft) BecomeLeader() {
 	if !rf.electionTimer.Stop() {
 		<-rf.electionTimer.C
 	}
-	rf.DPrintf("server %d becomes new leader with log entry length %d", rf.me, len(rf.logEntries))
+	rf.DPrintf("server %d becomes a new leader with log entry length %d", rf.me, len(rf.logEntries))
 
 	/* Initialize all nextIndex values to the next Index the leader will send to followers
 	And the nextIndex the leader will send to a follower is the index of the latest known replicated entry
