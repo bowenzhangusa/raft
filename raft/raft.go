@@ -297,6 +297,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) requestVoteFromPeers() {
 	lastLogTerm := 0
 	lastLogIndex := -1
+	rf.mu.Lock()
 	if len(rf.logEntries) > 0 {
 		lastLogIndex = len(rf.logEntries) - 1
 		lastLogTerm = rf.logEntries[lastLogIndex].Term
@@ -307,6 +308,7 @@ func (rf *Raft) requestVoteFromPeers() {
 		LastLogTerm:  lastLogTerm,
 		LastLogIndex: lastLogIndex,
 	}
+	rf.mu.Unlock()
 
 	// to send response structure and "ok" flag in a channel,
 	// we need to wrap it in a structure
@@ -315,7 +317,6 @@ func (rf *Raft) requestVoteFromPeers() {
 		IsOk bool
 	}
 
-	startTerm := rf.currentTerm
 	responseChan := make(chan ResponseMsg)
 	rf.DPrintf("sending RequestVote")
 
@@ -340,7 +341,7 @@ func (rf *Raft) requestVoteFromPeers() {
 
 	// collect responses
 	for resp := range responseChan {
-		if !resp.IsOk || rf.currentTerm != startTerm {
+		if !resp.IsOk {
 			continue
 		}
 
@@ -372,6 +373,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 // Send AppendEntries to all peers and collect results
 func (rf *Raft) broadcastHeartbeats() {
+	rf.mu.Lock()
 	args := AppendEntriesArgs{
 		Term:              rf.currentTerm,
 		LeaderId:          rf.me,
@@ -379,6 +381,7 @@ func (rf *Raft) broadcastHeartbeats() {
 		LogEntries:        []Log{},
 		PrevLogTerm:       0,
 	}
+	rf.mu.Unlock()
 
 	// to send response structure and "ok" flag in a channel,
 	// we need to wrap it in a structure
@@ -401,9 +404,12 @@ func (rf *Raft) broadcastHeartbeats() {
 			continue
 		}
 
+		rf.mu.Lock()
+		peerIsUpdating := rf.updatingPeers[i]
+		rf.mu.Unlock()
 		// this follower is currently accepting non-empty AppendEntries,
 		// no need to send it heartbeat
-		if rf.updatingPeers[i] {
+		if peerIsUpdating {
 			continue
 		}
 
@@ -413,10 +419,11 @@ func (rf *Raft) broadcastHeartbeats() {
 			if args.PrevLogIndex >= 0 {
 				args.PrevLogTerm = rf.logEntries[args.PrevLogIndex].Term
 			}
-			rf.mu.Unlock()
 			resp := AppendEntriesReply{PeerIndex: peerIndex}
+			status := rf.status
+			rf.mu.Unlock()
 			dateSent := time.Now()
-			if rf.status != STATUS_LEADER {
+			if status != STATUS_LEADER {
 				return
 			}
 			ok := rf.sendAppendEntries(peerIndex, &args, &resp)
@@ -443,12 +450,9 @@ func (rf *Raft) broadcastHeartbeats() {
 
 		if resp.IsNetworkOK {
 			// this happens when we just woke up as a previous leader
-			rf.becomeFollowerIfTermIsOlder(resp.Term, "heartbeat response")
-			if rf.status == STATUS_FOLLOWER {
+			if rf.becomeFollowerIfTermIsOlder(resp.Term, "heartbeat response") == STATUS_FOLLOWER {
 				break
 			}
-
-			rf.mu.Lock()
 
 			if !resp.Success {
 				rf.DPrintf(
@@ -459,8 +463,6 @@ func (rf *Raft) broadcastHeartbeats() {
 				)
 				rf.peerUpdates[resp.PeerIndex] <- rf.lastApplied
 			}
-
-			rf.mu.Unlock()
 		}
 	}
 }
@@ -525,11 +527,12 @@ func (rf *Raft) DPrintf(format string, a ...interface{}) {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	if rf.status != STATUS_LEADER {
 		return -1, -1, false
 	}
-
-	rf.mu.Lock()
 	newLog := Log{Command: command, Term: rf.currentTerm, Position: len(rf.logEntries)}
 	rf.logEntries = append(rf.logEntries, newLog)
 	rf.nextIndex[rf.me] = len(rf.logEntries) - 1
@@ -538,7 +541,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.lastApplied = len(rf.logEntries) - 1
 
 	rf.DPrintf("\tEnqueueing new command: %+v", command)
-	rf.mu.Unlock()
 	rf.enqueueEntryBroadcast(rf.lastApplied)
 
 	return newLength, rf.currentTerm, true
@@ -603,12 +605,7 @@ func (rf *Raft) updatePeersInBackground() {
 	for i, _ := range rf.peerUpdates {
 		go func(peer int) {
 			for entryIndex := range rf.peerUpdates[peer] {
-				if rf.status != STATUS_LEADER {
-					continue
-				}
-
 				rf.updatePeer(peer, entryIndex)
-				rf.updatingPeers[peer] = false
 			}
 		}(i)
 	}
@@ -617,9 +614,14 @@ func (rf *Raft) updatePeersInBackground() {
 // Sends AppendEntries to peer until its index becomes >= entryIndex
 func (rf *Raft) updatePeer(peer int, entryIndex int) {
 	retries := 0
-	rf.updatingPeers[peer] = true
 	for {
 		rf.mu.Lock()
+		if rf.status != STATUS_LEADER {
+			rf.mu.Unlock()
+			return
+		}
+
+		rf.updatingPeers[peer] = true
 		resp := AppendEntriesReply{PeerIndex: peer}
 		args := rf.constructArgsForBroadcast(resp.PeerIndex, entryIndex)
 		rf.DPrintf(
@@ -635,15 +637,17 @@ func (rf *Raft) updatePeer(peer int, entryIndex int) {
 			rf.becomeFollowerIfTermIsOlder(resp.Term, "AppendEntries response")
 		}
 
+		rf.mu.Lock()
 		if rf.status != STATUS_LEADER {
 			rf.DPrintf(
 				"Exiting UpdatePeer because host is not a leader any more",
 			)
+			rf.updatingPeers[peer] = false
+			rf.mu.Unlock()
 			return
 		}
 
 		if ok && resp.Success {
-			rf.mu.Lock()
 			// Update the match index and next index for this particular follower
 			rf.nextIndex[resp.PeerIndex] = resp.NextIndex
 			rf.matchIndex[resp.PeerIndex] = rf.nextIndex[resp.PeerIndex]
@@ -680,20 +684,19 @@ func (rf *Raft) updatePeer(peer int, entryIndex int) {
 						}
 						rf.commitIndex = entryIndex
 					}
+					rf.updatingPeers[peer] = false
 					rf.mu.Unlock()
 					return
 				} else {
 					// this peer accepted entry, but there is no majority yet
+					rf.updatingPeers[peer] = false
 					rf.mu.Unlock()
 					return
 				}
 			}
-			rf.mu.Unlock()
 		} else if ok && !resp.Success {
-			rf.mu.Lock()
 			// If it's a log consistency failure, we need to decrement nextIndex for the particular follower and resend log entry
 			rf.nextIndex[resp.PeerIndex] = rf.nextIndex[resp.PeerIndex] - 1
-			rf.mu.Unlock()
 
 			rf.DPrintf(
 				"Decremented nextIndex for peer %d: %d",
@@ -711,6 +714,7 @@ func (rf *Raft) updatePeer(peer int, entryIndex int) {
 			rf.nextIndex[resp.PeerIndex],
 			retries,
 		)
+		rf.mu.Unlock()
 	}
 }
 
@@ -767,9 +771,6 @@ func (rf *Raft) BecomeLeader() {
 
 // Turns current host into candidate
 func (rf *Raft) BecomeCandidate() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	rf.status = STATUS_CANDIDATE
 	rf.currentTerm++
 	rf.DPrintf("start leader election with term %d server %d", rf.currentTerm, rf.me)
@@ -777,29 +778,37 @@ func (rf *Raft) BecomeCandidate() {
 }
 
 // Turns current host into follower during election because either we discovered the current leader or a new turn
-func (rf *Raft) becomeFollowerIfTermIsOlder(term int, comment string) {
+// Returns new host status.
+// Comment is used only for debug.
+func (rf *Raft) becomeFollowerIfTermIsOlder(term int, comment string) int {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	// check if we have a new term
 	if rf.currentTerm < term {
-		rf.becomeFollower(term, comment)
+		return rf.becomeFollower(term, comment)
 	}
+
+	return rf.status
 }
 
 // Turns current host into follower and updates its term, if given term is newer.
+// Returns new host status.
 // Comment is used only for debug.
-func (rf *Raft) becomeFollowerIfTermIsOlderOrEqual(term int, comment string) {
+func (rf *Raft) becomeFollowerIfTermIsOlderOrEqual(term int, comment string) int {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	if rf.currentTerm <= term {
-		rf.becomeFollower(term, comment)
+		return rf.becomeFollower(term, comment)
 	}
+
+	return rf.status
 }
 
-// Turns current host into follower
-func (rf *Raft) becomeFollower(newTerm int, comment string) {
+// Turns current host into follower.
+// Returns new host status.
+func (rf *Raft) becomeFollower(newTerm int, comment string) int {
 	statusUpdated := false
 	termUpdated := false
 	oldTerm := rf.currentTerm
@@ -830,6 +839,8 @@ func (rf *Raft) becomeFollower(newTerm int, comment string) {
 			"[%s] term updated, old: %d",
 			comment, oldTerm)
 	}
+
+	return rf.status
 }
 
 func (rf *Raft) resetElectionTimer() {
@@ -850,18 +861,22 @@ func (rf *Raft) runTimers() {
 	for {
 		select {
 		case <-rf.electionTimer.C:
+			rf.mu.Lock()
 			// time to initiate an election
 			rf.DPrintf("election timeout")
 			rf.BecomeCandidate()
 			rf.resetElectionTimer()
 			go rf.requestVoteFromPeers()
+			rf.mu.Unlock()
 			break
 		case <-rf.heartbeatTimer.C:
+			rf.mu.Lock()
 			// time to send a heartbeat
 			if rf.status == STATUS_LEADER {
 				go rf.broadcastHeartbeats()
 			}
 			rf.resetHeartbeatTimer()
+			rf.mu.Unlock()
 			break
 		}
 	}
