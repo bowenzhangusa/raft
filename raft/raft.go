@@ -54,6 +54,13 @@ type Log struct {
 	Position int // position in the log
 }
 
+// A struct generated in a Start to send given Entry to a peer.
+// Term is whatever the term leader had when command was issued.
+type PeerUpdateCmd struct {
+	Entry int
+	Term  int
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -83,13 +90,16 @@ type Raft struct {
 	updatingPeers []bool
 
 	// A queue of new entries for each peer
-	peerUpdates []chan int
+	peerUpdates []chan PeerUpdateCmd
 
 	electionTimer  *time.Timer
 	heartbeatTimer *time.Timer
 
 	// message channel to client
 	clientCh chan ApplyMsg
+	// a channel that acts as a buffer through which commits are sent
+	// to the client
+	commitCh chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -122,16 +132,19 @@ type AppendEntriesReply struct {
 // example AppendEntries RPC handler.
 //
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.becomeFollowerIfTermIsOlderOrEqual(args.Term, fmt.Sprintf("AppendEntries request from %d", args.LeaderId))
-
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
+
+	rf.becomeFollowerIfTermIsOlderOrEqual(
+		args.Term,
+		fmt.Sprintf("AppendEntries request from %d", args.LeaderId),
+	)
+	rf.resetElectionTimer()
 
 	if args.Term < rf.currentTerm { // This happens when an old failed leader just woke up
 		reply.Success = false
 		rf.DPrintf("Got AppendEntries from %d, failing because RPC term %d is old", args.LeaderId, args.Term)
 	} else {
-		rf.resetElectionTimer()
+
 		// check if we have log consistency
 		if args.PrevLogIndex >= len(rf.logEntries) {
 			reply.Success = false
@@ -170,6 +183,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 
+	reply.Term = rf.currentTerm
+
 	// Decide if we need to send client commit message
 	if reply.Success && args.LeaderCommitIndex > rf.commitIndex {
 		oldCommitIndex := rf.commitIndex + 1
@@ -177,23 +192,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		for oldCommitIndex <= rf.commitIndex {
 			if oldCommitIndex >= 0 {
+				/*if rf.logEntries[oldCommitIndex].Term != rf.currentTerm {
+					rf.DPrintf("\t\tWILL NOT COMMIT ENTRY %d FROM PREV TERM %d, current term %d", oldCommitIndex, rf.logEntries[oldCommitIndex].Term, rf.currentTerm)
+					oldCommitIndex++
+					continue
+				}*/
 				// NOTE TODO: Normally, we will send index in our slice/array. However, log entries in actual raft
 				// NOTE TODO: starts at 1 instead of 0. So, we need to increment the index by one
-				rf.DPrintf(
-					"Sending committed message from follower to client for cmd %+v %d",
-					rf.logEntries[oldCommitIndex].Command,
-					oldCommitIndex,
-				)
-				rf.clientCh <- ApplyMsg{
+				cmdToSend := rf.logEntries[oldCommitIndex].Command
+				rf.commitCh <- ApplyMsg{
 					Index:   oldCommitIndex + 1,
-					Command: rf.logEntries[oldCommitIndex].Command,
+					Command: cmdToSend,
 				}
 			}
 			oldCommitIndex++
 		}
 	}
 
-	reply.Term = rf.currentTerm
+	rf.mu.Unlock()
 }
 
 // example RequestVote RPC arguments structure.
@@ -219,9 +235,10 @@ type RequestVoteReply struct {
 // RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	rf.becomeFollowerIfTermIsOlder(args.Term, fmt.Sprintf("RequestVote request from %d", args.CandidateId))
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	rf.becomeFollowerIfTermIsOlder(args.Term, fmt.Sprintf("RequestVote request from %d", args.CandidateId))
 
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
@@ -240,7 +257,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 		} else if selfLastLogTerm == args.LastLogTerm { // if in the same term, whoever has longer log is more up-to-date
 			if len(rf.logEntries) <= args.LastLogIndex+1 {
-				rf.resetElectionTimer()
 				reply.VoteGranted = true
 				rf.votedFor = args.CandidateId
 
@@ -252,6 +268,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				)
 			}
 		}
+	}
+
+	if reply.VoteGranted {
+		rf.resetElectionTimer()
 	}
 
 	rf.DPrintf(
@@ -308,17 +328,21 @@ func (rf *Raft) requestVoteFromPeers() {
 		LastLogTerm:  lastLogTerm,
 		LastLogIndex: lastLogIndex,
 	}
+	startTerm := rf.currentTerm
 	rf.mu.Unlock()
 
 	// to send response structure and "ok" flag in a channel,
 	// we need to wrap it in a structure
 	type ResponseMsg struct {
 		RequestVoteReply
-		IsOk bool
+		IsOk      bool
+		PeerIndex int
 	}
 
 	responseChan := make(chan ResponseMsg)
 	rf.DPrintf("sending RequestVote")
+	rxCount := 0
+	expectedRxCount := len(rf.peers) - 1
 
 	// send requests concurrently
 	for i, _ := range rf.peers {
@@ -329,10 +353,10 @@ func (rf *Raft) requestVoteFromPeers() {
 		go func(peerIndex int) {
 			resp := RequestVoteReply{}
 			ok := rf.sendRequestVote(peerIndex, &args, &resp)
-			rf.DPrintf("received RequestVote response from %d, ok: %t, granted: %t", peerIndex, ok, resp.VoteGranted)
 			responseChan <- ResponseMsg{
 				resp,
 				ok,
+				peerIndex,
 			}
 		}(i)
 	}
@@ -341,11 +365,19 @@ func (rf *Raft) requestVoteFromPeers() {
 
 	// collect responses
 	for resp := range responseChan {
-		if !resp.IsOk {
-			continue
-		}
+		rf.mu.Lock()
+		rf.DPrintf(
+			"received RequestVote response from %d, is ok: %t, granted: %t",
+			resp.PeerIndex,
+			resp.IsOk,
+			resp.VoteGranted,
+		)
 
-		if resp.VoteGranted {
+		if rf.currentTerm != startTerm {
+			rf.DPrintf(
+				"got RequestVote result, but term has already changed, ignoring it",
+			)
+		} else if resp.IsOk && resp.VoteGranted {
 			grantedVoteCount++
 			// if enough responses received, become a leader
 			// - don't need to wait for other responses
@@ -357,10 +389,16 @@ func (rf *Raft) requestVoteFromPeers() {
 					// but this host is not a candidate any more, so we ignore it
 					rf.DPrintf("got votes, but host is not a candidate")
 				}
-				return
 			}
-		} else {
+		} else if resp.IsOk {
 			rf.becomeFollowerIfTermIsOlder(resp.Term, "RequestVotes response")
+		}
+
+		rf.mu.Unlock()
+		rxCount++
+
+		if rxCount == expectedRxCount {
+			return
 		}
 	}
 }
@@ -374,14 +412,40 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // Send AppendEntries to all peers and collect results
 func (rf *Raft) broadcastHeartbeats() {
 	rf.mu.Lock()
-	args := AppendEntriesArgs{
-		Term:              rf.currentTerm,
-		LeaderId:          rf.me,
-		LeaderCommitIndex: rf.commitIndex,
-		LogEntries:        []Log{},
-		PrevLogTerm:       0,
+	peersToSend := []int{}
+	// prepare arguments
+	peerArgs := []AppendEntriesArgs{}
+	for i, _ := range rf.peers {
+		// skip myself and peers that may be already receiving AppendEntries
+		// from other goroutines
+		if i == rf.me || rf.updatingPeers[i] == true {
+			continue
+		}
+
+		rf.updatingPeers[i] = true
+		peersToSend = append(peersToSend, i)
+		args := AppendEntriesArgs{
+			Term:              rf.currentTerm,
+			LeaderId:          rf.me,
+			LeaderCommitIndex: rf.commitIndex,
+			LogEntries:        []Log{},
+			PrevLogIndex:      rf.nextIndex[i],
+			PrevLogTerm:       -1,
+		}
+
+		if args.PrevLogIndex >= 0 {
+			//rf.DPrintf("hb i %d l %d", args.PrevLogIndex, len(rf.logEntries))
+			args.PrevLogTerm = rf.logEntries[args.PrevLogIndex].Term
+		}
+		peerArgs = append(peerArgs, args)
 	}
 	rf.mu.Unlock()
+
+	if len(peersToSend) == 0 {
+		return
+	}
+	rxCount := 0
+	expectedRxCount := len(peersToSend)
 
 	// to send response structure and "ok" flag in a channel,
 	// we need to wrap it in a structure
@@ -399,33 +463,10 @@ func (rf *Raft) broadcastHeartbeats() {
 	}
 
 	// send requests concurrently
-	for i, _ := range rf.peers {
-		if i == rf.me {
-			continue
-		}
-
-		rf.mu.Lock()
-		peerIsUpdating := rf.updatingPeers[i]
-		rf.mu.Unlock()
-		// this follower is currently accepting non-empty AppendEntries,
-		// no need to send it heartbeat
-		if peerIsUpdating {
-			continue
-		}
-
+	for i, peerIndex := range peersToSend {
 		go func(peerIndex int, args AppendEntriesArgs) {
-			rf.mu.Lock()
-			args.PrevLogIndex = rf.nextIndex[peerIndex]
-			if args.PrevLogIndex >= 0 {
-				args.PrevLogTerm = rf.logEntries[args.PrevLogIndex].Term
-			}
 			resp := AppendEntriesReply{PeerIndex: peerIndex}
-			status := rf.status
-			rf.mu.Unlock()
 			dateSent := time.Now()
-			if status != STATUS_LEADER {
-				return
-			}
 			ok := rf.sendAppendEntries(peerIndex, &args, &resp)
 			responseChan <- ResponseMsg{
 				resp,
@@ -433,7 +474,7 @@ func (rf *Raft) broadcastHeartbeats() {
 				peerIndex,
 				dateSent,
 			}
-		}(i, args)
+		}(peerIndex, peerArgs[i])
 	}
 
 	// collect responses
@@ -448,10 +489,17 @@ func (rf *Raft) broadcastHeartbeats() {
 			)
 		}
 
+		rf.mu.Lock()
+		rf.updatingPeers[resp.PeerIndex] = false
+
 		if resp.IsNetworkOK {
 			// this happens when we just woke up as a previous leader
 			if rf.becomeFollowerIfTermIsOlder(resp.Term, "heartbeat response") == STATUS_FOLLOWER {
-				break
+				// we won't wait for other responses, so mark all other peers
+				// as not updating
+				for _, peerIndex := range peersToSend {
+					rf.updatingPeers[peerIndex] = false
+				}
 			}
 
 			if !resp.Success {
@@ -461,8 +509,15 @@ func (rf *Raft) broadcastHeartbeats() {
 					rf.lastApplied,
 					rf.logEntries[rf.lastApplied].Command,
 				)
-				rf.peerUpdates[resp.PeerIndex] <- rf.lastApplied
+				rf.peerUpdates[resp.PeerIndex] <- PeerUpdateCmd{rf.lastApplied, rf.currentTerm}
 			}
+		}
+
+		rf.mu.Unlock()
+
+		rxCount++
+		if rxCount == expectedRxCount {
+			return
 		}
 	}
 }
@@ -473,14 +528,6 @@ func (rf *Raft) DPrintf(format string, a ...interface{}) {
 	if Debug == 0 {
 		return
 	}
-
-	// a race condition might appear while collecting log info,
-	// but this is not critical for the functionality, so we ignore it
-	defer func() {
-		if r := recover(); r != nil {
-			fmt.Printf("[i%d] Error while logging %s: %s\n", rf.me, format, r)
-		}
-	}()
 
 	var lastAppliedCmd interface{}
 	var lastCommittedCmd interface{}
@@ -533,6 +580,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if rf.status != STATUS_LEADER {
 		return -1, -1, false
 	}
+
 	newLog := Log{Command: command, Term: rf.currentTerm, Position: len(rf.logEntries)}
 	rf.logEntries = append(rf.logEntries, newLog)
 	rf.nextIndex[rf.me] = len(rf.logEntries) - 1
@@ -541,7 +589,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.lastApplied = len(rf.logEntries) - 1
 
 	rf.DPrintf("\tEnqueueing new command: %+v", command)
-	rf.enqueueEntryBroadcast(rf.lastApplied)
+	rf.enqueueEntryBroadcast(
+		PeerUpdateCmd{rf.lastApplied, rf.currentTerm},
+	)
 
 	return newLength, rf.currentTerm, true
 }
@@ -576,7 +626,7 @@ func (rf *Raft) constructArgsForBroadcast(peerIndex int, maxEntryIndex int) Appe
 }
 
 // Enqueue AppendEntries command for all peers
-func (rf *Raft) enqueueEntryBroadcast(entryIndex int) {
+func (rf *Raft) enqueueEntryBroadcast(cmd PeerUpdateCmd) {
 	if rf.status != STATUS_LEADER {
 		rf.DPrintf(
 			"skipping AppendEntries because host is not a leader",
@@ -586,8 +636,8 @@ func (rf *Raft) enqueueEntryBroadcast(entryIndex int) {
 
 	rf.DPrintf(
 		"enqueueing AppendEntries for entry %d, cmd %+v",
-		entryIndex,
-		rf.logEntries[entryIndex].Command,
+		cmd.Entry,
+		rf.logEntries[cmd.Entry].Command,
 	)
 
 	// Send new entry to each peer.
@@ -596,7 +646,7 @@ func (rf *Raft) enqueueEntryBroadcast(entryIndex int) {
 			continue
 		}
 
-		rf.peerUpdates[i] <- entryIndex
+		rf.peerUpdates[i] <- cmd
 	}
 }
 
@@ -604,18 +654,29 @@ func (rf *Raft) enqueueEntryBroadcast(entryIndex int) {
 func (rf *Raft) updatePeersInBackground() {
 	for i, _ := range rf.peerUpdates {
 		go func(peer int) {
-			for entryIndex := range rf.peerUpdates[peer] {
-				rf.updatePeer(peer, entryIndex)
+			for cmd := range rf.peerUpdates[peer] {
+				rf.updatePeer(peer, cmd)
 			}
 		}(i)
 	}
 }
 
+func (rf *Raft) commitInBackground() {
+	for msg := range rf.commitCh {
+		rf.DPrintf(
+			"\tCommitting cmd %+v with index %d",
+			msg.Command,
+			msg.Index,
+		)
+		rf.clientCh <- msg
+	}
+}
+
 // Sends AppendEntries to peer until its index becomes >= entryIndex
-func (rf *Raft) updatePeer(peer int, entryIndex int) {
+func (rf *Raft) updatePeer(peer int, cmd PeerUpdateCmd) {
 	retries := 0
+	rf.mu.Lock()
 	for {
-		rf.mu.Lock()
 		if rf.status != STATUS_LEADER {
 			rf.mu.Unlock()
 			return
@@ -623,21 +684,22 @@ func (rf *Raft) updatePeer(peer int, entryIndex int) {
 
 		rf.updatingPeers[peer] = true
 		resp := AppendEntriesReply{PeerIndex: peer}
-		args := rf.constructArgsForBroadcast(resp.PeerIndex, entryIndex)
+		args := rf.constructArgsForBroadcast(resp.PeerIndex, cmd.Entry)
 		rf.DPrintf(
 			"Sending AppendEntries to %d with %d entries",
 			resp.PeerIndex,
 			len(args.LogEntries),
 		)
 		rf.mu.Unlock()
+
 		ok := rf.sendAppendEntries(peer, &args, &resp)
+		rf.mu.Lock()
 
 		if ok {
 			// this happens when we just woke up as a previous leader
 			rf.becomeFollowerIfTermIsOlder(resp.Term, "AppendEntries response")
 		}
 
-		rf.mu.Lock()
 		if rf.status != STATUS_LEADER {
 			rf.DPrintf(
 				"Exiting UpdatePeer because host is not a leader any more",
@@ -654,35 +716,44 @@ func (rf *Raft) updatePeer(peer int, entryIndex int) {
 			rf.DPrintf(
 				"AppendEntries to host %d succeeded with entry index %d; next index: %d, ",
 				resp.PeerIndex,
-				entryIndex,
+				cmd.Entry,
 				rf.nextIndex[resp.PeerIndex],
 			)
 
-			if resp.NextIndex >= entryIndex {
+			if resp.NextIndex >= cmd.Entry {
 				rf.updatingPeers[peer] = false
 				successCount := 0
 				for i, _ := range rf.peers {
-					if rf.matchIndex[i] >= entryIndex {
+					if rf.matchIndex[i] >= cmd.Entry {
 						successCount++
 					}
 				}
 
-				rf.DPrintf("Success count for entry %d: %d", entryIndex, successCount)
+				rf.DPrintf("Success count for entry %d: %d", cmd.Entry, successCount)
 
-				// If this entry was applied by majority, we can commit it
-				if successCount >= rf.getMajoritySize() {
-					// commit only if wasn't already committed
-					if rf.commitIndex < entryIndex {
-						rf.DPrintf(
-							"\tCommitting cmd %+v with index %d",
-							rf.logEntries[entryIndex].Command,
-							entryIndex,
-						)
-						rf.clientCh <- ApplyMsg{
-							Index:   entryIndex + 1,
-							Command: rf.logEntries[entryIndex].Command,
+				if rf.currentTerm != cmd.Term {
+					// see paper 5.4.2 -
+					// Raft never commits log entries from previous terms
+					// by counting replicas
+					rf.DPrintf(
+						"Exiting UpdatePeer because term has changed %d -> %d for cmd %+v/%d",
+						cmd.Term,
+						rf.currentTerm,
+						rf.logEntries[cmd.Entry].Command,
+						cmd.Entry,
+					)
+					rf.updatingPeers[peer] = false
+					rf.mu.Unlock()
+					return
+				} else if successCount >= rf.getMajoritySize() {
+					// If this entry was applied by majority,
+					// we can commit it, only if wasn't already committed
+					if rf.commitIndex < cmd.Entry {
+						rf.commitCh <- ApplyMsg{
+							Index:   cmd.Entry + 1,
+							Command: rf.logEntries[cmd.Entry].Command,
 						}
-						rf.commitIndex = entryIndex
+						rf.commitIndex = cmd.Entry
 					}
 					rf.updatingPeers[peer] = false
 					rf.mu.Unlock()
@@ -714,8 +785,9 @@ func (rf *Raft) updatePeer(peer int, entryIndex int) {
 			rf.nextIndex[resp.PeerIndex],
 			retries,
 		)
-		rf.mu.Unlock()
 	}
+
+	rf.mu.Unlock()
 }
 
 //
@@ -730,9 +802,6 @@ func (rf *Raft) Kill() {
 
 // Turns current host into leader
 func (rf *Raft) BecomeLeader() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	if rf.status != STATUS_LEADER {
 		rf.status = STATUS_LEADER
 	}
@@ -764,6 +833,10 @@ func (rf *Raft) BecomeLeader() {
 		}
 	}
 
+	for i := range rf.peers {
+		rf.updatingPeers[i] = false
+	}
+
 	// send heartbeat immediately without waiting for a ticker
 	// to make sure other peers will not timeout.
 	go rf.broadcastHeartbeats()
@@ -781,9 +854,6 @@ func (rf *Raft) BecomeCandidate() {
 // Returns new host status.
 // Comment is used only for debug.
 func (rf *Raft) becomeFollowerIfTermIsOlder(term int, comment string) int {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	// check if we have a new term
 	if rf.currentTerm < term {
 		return rf.becomeFollower(term, comment)
@@ -796,9 +866,6 @@ func (rf *Raft) becomeFollowerIfTermIsOlder(term int, comment string) int {
 // Returns new host status.
 // Comment is used only for debug.
 func (rf *Raft) becomeFollowerIfTermIsOlderOrEqual(term int, comment string) int {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	if rf.currentTerm <= term {
 		return rf.becomeFollower(term, comment)
 	}
@@ -866,8 +933,8 @@ func (rf *Raft) runTimers() {
 			rf.DPrintf("election timeout")
 			rf.BecomeCandidate()
 			rf.resetElectionTimer()
-			go rf.requestVoteFromPeers()
 			rf.mu.Unlock()
+			go rf.requestVoteFromPeers()
 			break
 		case <-rf.heartbeatTimer.C:
 			rf.mu.Lock()
@@ -905,19 +972,22 @@ func Make(peers []*labrpc.ClientEnd, me int, applyCh chan ApplyMsg) *Raft {
 	rf.heartbeatTimer = time.NewTimer(HEARTBEAT_FREQUENCY)
 	rf.clientCh = applyCh
 	rf.updatingPeers = make([]bool, len(rf.peers))
-	rf.peerUpdates = make([]chan int, len(rf.peers))
+	rf.peerUpdates = make([]chan PeerUpdateCmd, len(rf.peers))
+	// we don't want this channel to block, so we set a large enough buffer size
+	rf.commitCh = make(chan ApplyMsg, 100)
 
 	for i, _ := range rf.peers {
 		rf.updatingPeers[i] = false
 		// we don't want these channels to block when sending to them,
 		// so we set a safe, large enough buffer size
-		rf.peerUpdates[i] = make(chan int, 1000)
+		rf.peerUpdates[i] = make(chan PeerUpdateCmd, 1000)
 	}
 
 	rf.DPrintf("Majority size: %d", rf.getMajoritySize())
 
 	go rf.runTimers()
 	rf.updatePeersInBackground()
+	go rf.commitInBackground()
 
 	return rf
 }
