@@ -95,11 +95,11 @@ type Raft struct {
 	electionTimer  *time.Timer
 	heartbeatTimer *time.Timer
 
+	// this channel serves as a buffer to send committed entries to
+	// before they get to a client
+	commitCh chan ApplyMsg
 	// message channel to client
 	clientCh chan ApplyMsg
-	// this is a buffer to send committed entries to
-	// before they get to clientCh
-	commitCh chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -193,9 +193,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if oldCommitIndex >= 0 {
 				// NOTE TODO: Normally, we will send index in our slice/array. However, log entries in actual raft
 				// NOTE TODO: starts at 1 instead of 0. So, we need to increment the index by one
-
 				cmdToSend := rf.logEntries[oldCommitIndex].Command
-				rf.DPrintf("Committing %+v/%d as follower", cmdToSend, oldCommitIndex+1)
 				rf.commitCh <- ApplyMsg{
 					Index:   oldCommitIndex + 1,
 					Command: cmdToSend,
@@ -335,6 +333,7 @@ func (rf *Raft) requestVoteFromPeers() {
 
 	responseChan := make(chan ResponseMsg)
 	rf.DPrintf("sending RequestVote")
+	// received response counter and expected number of responses
 	rxCount := 0
 	expectedRxCount := len(rf.peers) - 1
 
@@ -411,8 +410,8 @@ func (rf *Raft) broadcastHeartbeats() {
 	// prepare arguments
 	peerArgs := []AppendEntriesArgs{}
 	for i, _ := range rf.peers {
-		// skip myself and peers that may be already receiving AppendEntries
-		// from other goroutines
+		// skip myself and peers that may be already receiving
+		// non-empty AppendEntries from "updatePeer"
 		if i == rf.me || rf.updatingPeers[i] == true {
 			continue
 		}
@@ -428,7 +427,6 @@ func (rf *Raft) broadcastHeartbeats() {
 		}
 
 		if args.PrevLogIndex >= 0 {
-			//rf.DPrintf("hb i %d l %d", args.PrevLogIndex, len(rf.logEntries))
 			args.PrevLogTerm = rf.logEntries[args.PrevLogIndex].Term
 		}
 		peerArgs = append(peerArgs, args)
@@ -439,6 +437,7 @@ func (rf *Raft) broadcastHeartbeats() {
 	if len(peersToSend) == 0 {
 		return
 	}
+	// received response counter and expected number of responses
 	rxCount := 0
 	expectedRxCount := len(peersToSend)
 
@@ -485,7 +484,6 @@ func (rf *Raft) broadcastHeartbeats() {
 		}
 
 		rf.mu.Lock()
-		rf.updatingPeers[resp.PeerIndex] = false
 
 		if resp.IsNetworkOK {
 			// this happens when we just woke up as a previous leader
@@ -599,8 +597,8 @@ func (rf *Raft) constructArgsForBroadcast(peerIndex int, maxEntryIndex int) Appe
 		entriesToSend = rf.logEntries[prevLogIndex+1: maxEntryIndex+1]
 	} else {
 		// when we want to send follower an entry that was already accepted by it
-		// - no need to do anything
-		/*rf.DPrintf("Lo %d, hi %d, len %d", prevLogIndex+1, maxEntryIndex+1, len(rf.logEntries))*/
+		// - no need to do anything.
+		// TODO this scenario can be omptimized
 	}
 	args := AppendEntriesArgs{
 		Term:              rf.currentTerm,
@@ -650,10 +648,11 @@ func (rf *Raft) updatePeersInBackground() {
 	}
 }
 
+// Sends committed commands to client channel
 func (rf *Raft) commitInBackground() {
 	for msg := range rf.commitCh {
 		rf.DPrintf(
-			"\tCommitting cmd %+v with index %d from buf",
+			"\tCommitting cmd %+v with index %d",
 			msg.Command,
 			msg.Index,
 		)
@@ -665,18 +664,21 @@ func (rf *Raft) commitInBackground() {
 func (rf *Raft) updatePeer(peer int, cmd PeerUpdateCmd) {
 	retries := 0
 	rf.mu.Lock()
+	rf.updatingPeers[peer] = true
 
+	// upon returning from this function,
+	// mark a peer as not receiving updates,
+	// and unlock the mutex
 	defer func() {
 		rf.updatingPeers[peer] = false
 		rf.mu.Unlock()
 	}()
 
 	for {
-		if rf.status != STATUS_LEADER || rf.currentTerm != cmd.Term {
+		if rf.status != STATUS_LEADER {
 			return
 		}
 
-		rf.updatingPeers[peer] = true
 		resp := AppendEntriesReply{PeerIndex: peer}
 		args := rf.constructArgsForBroadcast(resp.PeerIndex, cmd.Entry)
 		rf.DPrintf(
@@ -722,27 +724,9 @@ func (rf *Raft) updatePeer(peer int, cmd PeerUpdateCmd) {
 				}
 
 				rf.DPrintf("Success count for entry %d: %d", cmd.Entry, successCount)
-
-				if rf.currentTerm != cmd.Term {
-					// see paper 5.4.2 -
-					// Raft never commits log entries from previous terms
-					// by counting replicas
-					rf.DPrintf(
-						"Exiting UpdatePeer because term has changed %d -> %d for cmd %+v/%d",
-						cmd.Term,
-						rf.currentTerm,
-						rf.logEntries[cmd.Entry].Command,
-						cmd.Entry,
-					)
-					return
-				} else if successCount >= rf.getMajoritySize() {
-					// commit only if wasn't already committed
+				if successCount >= rf.getMajoritySize() {
+					// commit only if entry wasn't already committed
 					if rf.commitIndex == cmd.Entry-1 {
-						rf.DPrintf(
-							"\tCommitting cmd as leader %+v with index %d",
-							rf.logEntries[cmd.Entry].Command,
-							cmd.Entry,
-						)
 						rf.commitCh <- ApplyMsg{
 							Index:   cmd.Entry + 1,
 							Command: rf.logEntries[cmd.Entry].Command,
@@ -751,7 +735,7 @@ func (rf *Raft) updatePeer(peer int, cmd PeerUpdateCmd) {
 					}
 					return
 				} else {
-					// this peer accepted entry, but there is no majority yet
+					// this peer accepted an entry, but there is no majority yet
 					return
 				}
 			}
@@ -962,13 +946,13 @@ func Make(peers []*labrpc.ClientEnd, me int, applyCh chan ApplyMsg) *Raft {
 	rf.updatingPeers = make([]bool, len(rf.peers))
 	rf.peerUpdates = make([]chan PeerUpdateCmd, len(rf.peers))
 	// we don't want this channel to block, so we set a large enough buffer size
-	rf.commitCh = make(chan ApplyMsg, 200)
+	rf.commitCh = make(chan ApplyMsg, 100)
 
 	for i, _ := range rf.peers {
 		rf.updatingPeers[i] = false
 		// we don't want these channels to block when sending to them,
 		// so we set a safe, large enough buffer size
-		rf.peerUpdates[i] = make(chan PeerUpdateCmd, 1000)
+		rf.peerUpdates[i] = make(chan PeerUpdateCmd, 500)
 	}
 
 	rf.DPrintf("Majority size: %d", rf.getMajoritySize())
