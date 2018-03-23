@@ -417,7 +417,6 @@ func (rf *Raft) broadcastHeartbeats() {
 			continue
 		}
 
-		rf.updatingPeers[i] = true
 		peersToSend = append(peersToSend, i)
 		args := AppendEntriesArgs{
 			Term:              rf.currentTerm,
