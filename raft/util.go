@@ -7,7 +7,7 @@ import (
 )
 
 // Debugging
-const Debug = 1
+const Debug = 0
 // Heartbeats account for a majority of logs, so we enable them separately
 const DebugHeartbeats = 0
 
@@ -25,6 +25,13 @@ func getElectionTimeout() time.Duration {
 
 func min(a, b int) int {
 	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
 		return a
 	}
 	return b
